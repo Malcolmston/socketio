@@ -327,18 +327,29 @@ func (c *conn) handleDisconnect(pkt Packet) {
 // startPing launches the server heartbeat for this session.
 func (c *conn) startPing() {
 	c.pingOnce.Do(func() {
-		c.stopPing = make(chan struct{})
-		go c.pingLoop()
+		stop := make(chan struct{})
+		// Publish under c.mu. sync.Once guarantees this runs once and orders it
+		// before anything the ping goroutine does, but it says nothing about a
+		// reader that does not go through the Once — and cleanup() reads
+		// c.stopPing under c.mu while closing the connection. That is the race the
+		// detector reported: Server.Close -> removeConn -> cleanup reading the
+		// field while this line wrote it.
+		c.mu.Lock()
+		c.stopPing = stop
+		c.mu.Unlock()
+		// Hand the channel to the loop directly rather than letting it read the
+		// shared field, so the heartbeat needs no lock on its hot path.
+		go c.pingLoop(stop)
 	})
 }
 
-func (c *conn) pingLoop() {
+func (c *conn) pingLoop(stop <-chan struct{}) {
 	interval := c.server.opts.PingInterval
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-c.stopPing:
+		case <-stop:
 			return
 		case <-ticker.C:
 			c.mu.Lock()

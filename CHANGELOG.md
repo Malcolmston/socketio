@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-08-11
+### Fixed
+- **Data race between the heartbeat start and connection teardown.** `startPing`
+  assigned `conn.stopPing` while holding only its `sync.Once`, but `cleanup()`
+  reads that field under `conn.mu` when a connection is torn down — so
+  `Server.Close` -> `removeConn` -> `cleanup` could read the channel while the
+  heartbeat was publishing it. `sync.Once` guarantees the initialiser runs once
+  and orders it before the goroutine it starts; it does not synchronise with a
+  reader that never goes through the Once. The assignment is now made under
+  `conn.mu`, and the ping loop receives the stop channel as a parameter instead of
+  re-reading the shared field, so the heartbeat needs no lock on its hot path.
+
+  Found by the nightly race job once it was actually running the race detector.
+  It reproduced roughly one run in six, and the whole package is clean over eight
+  consecutive `-race` runs after the fix.
+
 ## [0.5.0] - 2026-08-11
 ### Security
 - **Silent namespace middleware no longer admits the socket (GHSA-fv7v-hmg8-9xmx,
