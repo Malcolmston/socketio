@@ -6,6 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.5.0] - 2026-08-11
+### Security
+- **Silent namespace middleware no longer admits the socket (GHSA-fv7v-hmg8-9xmx,
+  critical).** A middleware that returned without calling `next()` — the natural
+  way to express "reject" — had its socket connected anyway, bypassing
+  authentication entirely. `runMiddleware` now reports that case and the
+  handshake is left unanswered.
+- **Out-of-range binary placeholders are rejected (GHSA-3r64-4j95-pf42, medium).**
+  Binary reassembly handed an out-of-range or zero-attachment placeholder to the
+  application as data, causing type confusion. `Reconstruct` now returns an error.
+
+### Changed
+- Measured parity against `socket.io@4.8.1` raised from 81.8% to 97.0%
+  (160/165), plus nested `engineio` and `client` harnesses at 100% of compared
+  cases. Ordered event delivery, acks only when handled, reserved event names
+  refused, `OnDisconnecting`, and client handling of a server `DISCONNECT`.
+
+### Breaking
+- `Reconstruct` returns `(any, error)`.
+- Client addressing matches `socket.io-client`: the URL path is the NAMESPACE, so
+  `Dial("http://h/admin")` now connects to namespace `/admin`. Previously it
+  requested HTTP path `/admin/` and landed on namespace `/` — the opposite of the
+  equivalent `io()` call. The HTTP mount path moved to `Options.Path`.
 ### Security
 - **Namespace middleware that never calls `next()` is now a deny, not an admit**
   (GHSA-fv7v-hmg8-9xmx). `Namespace.runMiddleware` used to return a `nil` error —
