@@ -17,6 +17,11 @@
 // fully connected and ready to Emit. Optional authentication data is sent with
 // the CONNECT packet via Options.Auth, matching the server-side socket.Auth().
 //
+// Addressing follows socket.io-client: the PATH of the dialled URL names the
+// namespace, so Dial("http://host/admin") connects to namespace "/admin", while
+// the HTTP path the server is mounted on is Options.Path (default
+// DefaultPath, "/socket.io/"). See ResolveEndpoint for the full set of rules.
+//
 // Under the hood the client speaks Engine.IO v4 directly over a single
 // WebSocket (it does not use HTTP long-polling): it dials ws(s)://.../socket.io/
 // with EIO=4&transport=websocket, reads the Engine.IO OPEN handshake, sends the
@@ -32,10 +37,13 @@
 // to avoid deadlocking the loop; returning a non-nil slice from a handler
 // acknowledges an event the server sent with an ack id. EmitWithAck waits up to
 // the supplied timeout and returns an error if no acknowledgement arrives. When
-// Options.Reconnection is enabled, an unexpected transport drop triggers an
-// exponential-backoff reconnect loop (ReconnectionDelay doubling up to five
-// seconds, bounded by ReconnectionAttempts) and fires the local "reconnect"
-// event; a user-initiated Close suppresses reconnection.
+// Options.Reconnection is enabled, an unexpected transport drop triggers a
+// reconnect loop on the same schedule as the JavaScript client's Manager — a
+// Backoff seeded with ReconnectionDelay, ReconnectionDelayMax and
+// RandomizationFactor, bounded by ReconnectionAttempts — and fires the local
+// "reconnect" event; a user-initiated Close suppresses reconnection. Note that
+// socket.io-client reconnects by default whereas Options.Reconnection must be
+// set explicitly, because a Go zero value cannot express a true default.
 //
 // Compared with the JavaScript socket.io-client the surface is intentionally
 // small: one namespace per Client, no long-polling fallback, and lifecycle
@@ -47,6 +55,7 @@ package client
 
 import (
 	"errors"
+	"math/rand"
 	"net/url"
 	"strings"
 	"sync"
@@ -70,7 +79,7 @@ type Client struct {
 	mu          sync.Mutex
 	ws          *ws.Conn
 	handlers    map[string][]Handler
-	ackCounter  uint64
+	ackIDs      AckIDs
 	pendingAcks map[uint64]chan []any
 	sid         string
 	closed      bool
@@ -83,49 +92,138 @@ type Client struct {
 	connectOnce *sync.Once
 }
 
-// Options configures Dial.
+// DefaultPath is the HTTP path a Socket.IO server is mounted on, and the path
+// the client requests unless Options.Path says otherwise. It is the counterpart
+// of socket.io-client's `path` option (whose default is "/socket.io").
+const DefaultPath = "/socket.io/"
+
+// Options configures Dial. The zero value is usable: every field below states
+// the default applied by WithDefaults.
 type Options struct {
-	// Namespace to connect to (default "/").
+	// Namespace to connect to. When empty the namespace is taken from the path
+	// of the dialled URL (socket.io-client's rule), which is "/" for a bare
+	// host.
 	Namespace string
+	// Path is the HTTP path the server is mounted on (default DefaultPath). It
+	// is never taken from the dialled URL, whose path names the namespace. A
+	// missing trailing slash is added.
+	Path string
 	// Auth is an optional payload sent with the CONNECT packet.
 	Auth any
-	// DialTimeout bounds the connection handshake (default 10s).
+	// DialTimeout bounds the connection handshake (default 20s, matching
+	// socket.io-client's `timeout`).
 	DialTimeout time.Duration
 	// Reconnection enables automatic reconnection after an unexpected
-	// disconnect.
+	// disconnect. Note that socket.io-client reconnects by DEFAULT; a Go zero
+	// value cannot express a true default, so this must be set explicitly (see
+	// API-DEVIATIONS.md).
 	Reconnection bool
-	// ReconnectionAttempts bounds reconnection tries (0 = unlimited).
+	// ReconnectionAttempts bounds reconnection tries (0 = unlimited, which is
+	// socket.io-client's Infinity default).
 	ReconnectionAttempts int
-	// ReconnectionDelay is the initial backoff between attempts (default 1s,
-	// doubling up to 5s).
+	// ReconnectionDelay is the initial delay between attempts (default 1s).
 	ReconnectionDelay time.Duration
+	// ReconnectionDelayMax is the ceiling the delay grows to (default 5s).
+	ReconnectionDelayMax time.Duration
+	// RandomizationFactor spreads each reconnection delay by up to this
+	// fraction, in [0,1]. socket.io-client defaults it to 0.5; a Go zero value
+	// cannot express that default, so jitter is off unless set (see
+	// API-DEVIATIONS.md).
+	RandomizationFactor float64
+}
+
+// WithDefaults returns a copy of o with every unset field filled in with the
+// default documented on it. Dial and ResolveEndpoint both apply it, so the
+// options a Client runs with are always the normalised ones.
+func (o Options) WithDefaults() Options {
+	if o.Path == "" {
+		o.Path = DefaultPath
+	}
+	if !strings.HasSuffix(o.Path, "/") {
+		o.Path += "/"
+	}
+	if !strings.HasPrefix(o.Path, "/") {
+		o.Path = "/" + o.Path
+	}
+	if o.DialTimeout <= 0 {
+		o.DialTimeout = 20 * time.Second
+	}
+	if o.ReconnectionDelay <= 0 {
+		o.ReconnectionDelay = time.Second
+	}
+	if o.ReconnectionDelayMax <= 0 {
+		o.ReconnectionDelayMax = 5 * time.Second
+	}
+	if o.RandomizationFactor < 0 {
+		o.RandomizationFactor = 0
+	}
+	if o.RandomizationFactor > 1 {
+		o.RandomizationFactor = 0
+	}
+	return o
+}
+
+// ConnectPacket builds the Socket.IO CONNECT packet that opens a namespace,
+// carrying auth as its payload when non-nil. It is what Dial sends after the
+// Engine.IO handshake, and the counterpart of socket.io-client's
+// Socket._sendConnectPacket.
+func ConnectPacket(namespace string, auth any) socketio.Packet {
+	p := socketio.Packet{Type: socketio.Connect, Namespace: namespace}
+	if auth != nil {
+		p.Data = auth
+	}
+	return p
+}
+
+// EventPacket builds the EVENT packet an Emit sends: the event name followed by
+// its arguments, addressed to namespace. A non-nil ackID asks the server for an
+// acknowledgement under that id (what EmitWithAck does). Reserved Socket.IO
+// event names are refused with socketio.ErrReservedEvent, matching
+// socket.io-client, which throws for them.
+func EventPacket(namespace, event string, ackID *uint64, args []any) (socketio.Packet, error) {
+	if socketio.IsReservedEvent(event) {
+		return socketio.Packet{}, socketio.ErrReservedEvent
+	}
+	data := append([]any{event}, args...)
+	return socketio.Packet{Type: socketio.Event, Namespace: namespace, ID: ackID, Data: data}, nil
+}
+
+// AckIDs allocates the acknowledgement ids an emit claims: 0 for the first
+// acknowledged emit on a connection, then 1, 2, … . It is the counterpart of
+// socket.io-client's Socket.ids counter, and every Client owns one. The zero
+// value is ready to use and is safe for concurrent use.
+type AckIDs struct {
+	mu   sync.Mutex
+	next uint64
+}
+
+// Next returns the id for the next acknowledged emit and advances the counter.
+func (a *AckIDs) Next() uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	id := a.next
+	a.next++
+	return id
 }
 
 // Dial connects to a Socket.IO server at rawURL (http:// or ws://) and returns
-// once the Socket.IO CONNECT handshake completes.
+// once the Socket.IO CONNECT handshake completes. The path of rawURL names the
+// namespace, as in socket.io-client — see ResolveEndpoint.
 func Dial(rawURL string, opts ...Options) (*Client, error) {
 	var o Options
 	if len(opts) > 0 {
 		o = opts[0]
 	}
-	if o.Namespace == "" {
-		o.Namespace = "/"
-	}
-	if o.DialTimeout == 0 {
-		o.DialTimeout = 10 * time.Second
-	}
-	if o.ReconnectionDelay == 0 {
-		o.ReconnectionDelay = time.Second
-	}
-
-	wsURL, err := engineWSURL(rawURL)
+	endpoint, err := ResolveEndpoint(rawURL, o)
 	if err != nil {
 		return nil, err
 	}
+	o = o.WithDefaults()
+	o.Namespace = endpoint.Namespace
 
 	c := &Client{
-		namespace:   o.Namespace,
-		wsURL:       wsURL,
+		namespace:   endpoint.Namespace,
+		wsURL:       endpoint.URL,
 		opts:        o,
 		handlers:    make(map[string][]Handler),
 		pendingAcks: make(map[uint64]chan []any),
@@ -170,11 +268,7 @@ func (c *Client) establish() error {
 
 	go c.readLoop(conn)
 
-	connect := socketio.Packet{Type: socketio.Connect, Namespace: c.namespace}
-	if c.opts.Auth != nil {
-		connect.Data = c.opts.Auth
-	}
-	if err := c.sendPacket(connect); err != nil {
+	if err := c.sendPacket(ConnectPacket(c.namespace, c.opts.Auth)); err != nil {
 		_ = conn.Close()
 		return err
 	}
@@ -198,9 +292,17 @@ func (c *Client) establish() error {
 // reconnectLoop attempts to re-establish the connection with exponential
 // backoff after an unexpected disconnect.
 func (c *Client) reconnectLoop() {
-	delay := c.opts.ReconnectionDelay
+	// Same schedule as socket.io-client's Manager: a backo2-shaped exponential
+	// backoff seeded from the reconnection options, jittered by
+	// RandomizationFactor.
+	backoff := NewBackoff(BackoffOptions{
+		Min:    c.opts.ReconnectionDelay,
+		Max:    c.opts.ReconnectionDelayMax,
+		Jitter: c.opts.RandomizationFactor,
+		Rand:   rand.Float64,
+	})
 	for attempt := 1; c.opts.ReconnectionAttempts == 0 || attempt <= c.opts.ReconnectionAttempts; attempt++ {
-		time.Sleep(delay)
+		time.Sleep(backoff.Duration())
 		c.mu.Lock()
 		closed := c.closed
 		c.mu.Unlock()
@@ -208,11 +310,9 @@ func (c *Client) reconnectLoop() {
 			return
 		}
 		if err := c.establish(); err == nil {
+			backoff.Reset()
 			c.fireLocal("reconnect")
 			return
-		}
-		if delay < 5*time.Second {
-			delay *= 2
 		}
 	}
 }
@@ -247,25 +347,30 @@ func (c *Client) On(event string, h Handler) {
 // socketio.ErrReservedEvent without sending anything, matching socket.io-client,
 // which throws for those names.
 func (c *Client) Emit(event string, args ...any) error {
-	if socketio.IsReservedEvent(event) {
-		return socketio.ErrReservedEvent
+	p, err := EventPacket(c.namespace, event, nil, args)
+	if err != nil {
+		return err
 	}
-	data := append([]any{event}, args...)
-	return c.sendPacket(socketio.Packet{Type: socketio.Event, Namespace: c.namespace, Data: data})
+	return c.sendPacket(p)
 }
 
 // EmitWithAck sends an event and waits for the server's acknowledgement, up to
 // timeout.
 func (c *Client) EmitWithAck(event string, timeout time.Duration, args ...any) ([]any, error) {
+	id := c.ackIDs.Next()
 	c.mu.Lock()
-	id := c.ackCounter
-	c.ackCounter++
 	ch := make(chan []any, 1)
 	c.pendingAcks[id] = ch
 	c.mu.Unlock()
 
-	data := append([]any{event}, args...)
-	if err := c.sendPacket(socketio.Packet{Type: socketio.Event, Namespace: c.namespace, ID: &id, Data: data}); err != nil {
+	p, err := EventPacket(c.namespace, event, &id, args)
+	if err != nil {
+		c.mu.Lock()
+		delete(c.pendingAcks, id)
+		c.mu.Unlock()
+		return nil, err
+	}
+	if err := c.sendPacket(p); err != nil {
 		return nil, err
 	}
 	select {
@@ -534,11 +639,40 @@ func (c *Client) finishConnect(err error) {
 	})
 }
 
-// engineWSURL turns an http(s)/ws(s) base URL into the Engine.IO websocket URL.
-func engineWSURL(rawURL string) (string, error) {
+// Endpoint is where a Dial will actually connect: the Engine.IO WebSocket URL
+// and the Socket.IO namespace to hand shake for. It is the result of applying
+// socket.io-client's addressing rules to a user-supplied URL.
+type Endpoint struct {
+	// URL is the ws:// or wss:// URL of the Engine.IO endpoint, including the
+	// mandatory EIO=4&transport=websocket query.
+	URL string
+	// Namespace is the Socket.IO namespace the CONNECT packet will name.
+	Namespace string
+}
+
+// ResolveEndpoint derives the Engine.IO WebSocket URL and the Socket.IO
+// namespace from a user-supplied URL, following the same rules as
+// socket.io-client's url() plus Transport.uri():
+//
+//   - http/ws become ws, https/wss become wss;
+//   - the URL's PATH is the namespace, not the HTTP path — io("http://h/admin")
+//     connects to namespace "/admin". The HTTP path the server is mounted on is
+//     Options.Path (default DefaultPath), never taken from the URL;
+//   - a port that is the default for the scheme (80 for ws, 443 for wss) is
+//     omitted, so ws://h:80/ and ws://h/ produce one endpoint, not two;
+//   - userinfo is dropped: Engine.IO addresses the host, and credentials belong
+//     in Options.Auth or a header, not in the transport URL;
+//   - any query in the URL is preserved, with EIO=4 and transport=websocket
+//     added.
+//
+// An explicit Options.Namespace wins over the namespace in the URL. Dial calls
+// this; it is exported so that addressing can be inspected (and tested) without
+// opening a connection.
+func ResolveEndpoint(rawURL string, opts Options) (Endpoint, error) {
+	o := opts.WithDefaults()
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return "", err
+		return Endpoint{}, err
 	}
 	switch u.Scheme {
 	case "http", "ws":
@@ -548,14 +682,35 @@ func engineWSURL(rawURL string) (string, error) {
 	default:
 		u.Scheme = "ws"
 	}
-	if u.Path == "" || u.Path == "/" {
-		u.Path = "/socket.io/"
-	} else if !strings.HasSuffix(u.Path, "/") {
-		u.Path += "/"
+
+	// The URL path names the namespace (socket.io-client: io.socket(parsed.path)).
+	namespace := u.Path
+	if namespace == "" {
+		namespace = "/"
 	}
+	if !strings.HasPrefix(namespace, "/") {
+		namespace = "/" + namespace
+	}
+	if opts.Namespace != "" {
+		namespace = opts.Namespace
+	}
+
+	// Credentials never travel in the transport URL.
+	u.User = nil
+
+	// Drop a port that is the scheme's default, as Transport._port does.
+	if port := u.Port(); (u.Scheme == "ws" && port == "80") || (u.Scheme == "wss" && port == "443") {
+		host := u.Hostname()
+		if strings.Contains(host, ":") { // IPv6 literal
+			host = "[" + host + "]"
+		}
+		u.Host = host
+	}
+
+	u.Path = o.Path
 	q := u.Query()
 	q.Set("EIO", "4")
 	q.Set("transport", "websocket")
 	u.RawQuery = q.Encode()
-	return u.String(), nil
+	return Endpoint{URL: u.String(), Namespace: namespace}, nil
 }

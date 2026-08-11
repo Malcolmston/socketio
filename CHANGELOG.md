@@ -24,6 +24,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it expected `[]byte`. `Reconstruct` now returns `(any, error)` (breaking).
 
 ### Changed / Fixed (cross-language parity with socket.io@4.8.1)
+- **Client addressing now follows `socket.io-client` (breaking).** The PATH of
+  the dialled URL is the NAMESPACE, as in `io("http://host/admin")`, and the HTTP
+  path the server is mounted on is the new `client.Options.Path` (default
+  `client.DefaultPath`, `"/socket.io/"`). `client.Dial("http://host/admin")` used
+  to request the HTTP path `/admin/` and connect to namespace `/` instead. A port
+  that is the scheme's default (80 for `ws`, 443 for `wss`) is now dropped, and
+  userinfo in the URL never reaches the transport URL. The new
+  `client.ResolveEndpoint` exposes the whole derivation without dialling.
+- **Reconnection follows the JavaScript `Manager`'s schedule.** `Options` gained
+  `ReconnectionDelayMax` (default 5s) and `RandomizationFactor`, and the
+  reconnect loop now drives a `Backoff` instead of an open-coded doubling.
+  `Options.DialTimeout`'s default moved from 10s to upstream's 20s
+  (`timeout: 20000`). `Options.WithDefaults` exposes the normalisation `Dial`
+  applies.
+- **`Backoff` now computes exactly what `backo2` computes.** The jitter deviation
+  is floored before it is applied, the ceiling is enforced *after* the jitter (so
+  a clamped delay is jittered from its unclamped value), a delay is truncated to
+  whole milliseconds, and a jitter outside `(0,1]` disables randomisation instead
+  of being clamped to 1. Six parity cases were wrong before.
+- **`client.ConnectPacket`, `client.EventPacket` and `client.AckIDs`** — the
+  packet constructors `Dial`/`Emit`/`EmitWithAck` use, and the ack-id allocator
+  (upstream's `Socket.ids`), are now exported so the frames a client emits can be
+  compared against `socket.io-client` without a server.
 - **Ordered event delivery.** Inbound events for a socket are dispatched by a
   single per-socket goroutine in arrival order, instead of one goroutine per
   packet; back-to-back emits are no longer reordered.

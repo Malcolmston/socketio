@@ -1,6 +1,7 @@
 package client
 
 import (
+	"math"
 	"sync"
 	"time"
 )
@@ -14,9 +15,10 @@ type BackoffOptions struct {
 	Max time.Duration
 	// Factor is the exponential growth base per attempt (default 2).
 	Factor float64
-	// Jitter is the randomization fraction in [0,1]; 0 disables jitter. A value
-	// of 0.5 spreads each delay by up to ±50%. Jitter is only applied when Rand
-	// is non-nil, keeping a default Backoff fully deterministic.
+	// Jitter is the randomization fraction in (0,1]; 0 — or any value outside
+	// that range, as in backo2 — disables jitter. A value of 0.5 spreads each
+	// delay by up to ±50%. Jitter is only applied when Rand is non-nil, keeping
+	// a default Backoff fully deterministic.
 	Jitter float64
 	// Rand supplies the randomness used for jitter; it must return a value in
 	// [0,1). Inject a deterministic function in tests, or math/rand's Float64 in
@@ -58,36 +60,39 @@ func NewBackoff(opts BackoffOptions) *Backoff {
 	if b.factor <= 0 {
 		b.factor = 2
 	}
-	if b.jitter < 0 {
+	// backo2 accepts a jitter only in (0,1]; anything else disables it outright
+	// rather than being clamped, and this port follows that so the reconnection
+	// schedule cannot silently differ from the JavaScript client's.
+	if b.jitter <= 0 || b.jitter > 1 {
 		b.jitter = 0
-	}
-	if b.jitter > 1 {
-		b.jitter = 1
 	}
 	return b
 }
 
-// Duration returns the delay for the current attempt and advances to the next.
-// The base delay is min * factor^attempt, clamped to max. When jitter and a Rand
-// source are configured, the delay is randomized by up to ±(jitter fraction)
-// before clamping.
+// Duration returns the delay for the current attempt and advances to the next,
+// computing exactly what backo2 (the module socket.io-client's Manager uses)
+// would compute:
+//
+//	ms        = min * factor^attempt          // NOT clamped yet
+//	deviation = floor(rand * jitter * ms)     // jitter only, when a Rand is set
+//	ms        = ms ± deviation                // sign from the same draw
+//	result    = trunc(min(ms, max)) in whole milliseconds
+//
+// The order matters: the ceiling is applied after the jitter, not before, and
+// the deviation is floored to whole milliseconds — so a jittered delay derived
+// from an already-clamped base (or from an unfloored deviation) would drift away
+// from the JavaScript client's schedule.
 func (b *Backoff) Duration() time.Duration {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	ms := float64(b.min)
-	for i := 0; i < b.attempts; i++ {
-		ms *= b.factor
-		if ms >= float64(b.max) {
-			ms = float64(b.max)
-			break
-		}
-	}
+	ms := float64(b.min) / float64(time.Millisecond)
+	ms *= math.Pow(b.factor, float64(b.attempts))
 	b.attempts++
 
 	if b.jitter > 0 && b.rand != nil {
 		r := b.rand()
-		deviation := r * b.jitter * ms
+		deviation := math.Floor(r * b.jitter * ms)
 		// Alternate sign deterministically off the same draw, matching backo2.
 		if int(r*10)&1 == 0 {
 			ms -= deviation
@@ -96,14 +101,15 @@ func (b *Backoff) Duration() time.Duration {
 		}
 	}
 
-	d := time.Duration(ms)
-	if d > b.max {
-		d = b.max
+	maxMS := float64(b.max) / float64(time.Millisecond)
+	if ms > maxMS || math.IsInf(ms, 1) || math.IsNaN(ms) {
+		ms = maxMS
 	}
-	if d < 0 {
-		d = 0
+	if ms < 0 {
+		ms = 0
 	}
-	return d
+	// backo2 finishes with `| 0`: the delay is a whole number of milliseconds.
+	return time.Duration(int64(ms)) * time.Millisecond
 }
 
 // Reset returns the backoff to its initial state, so the next Duration call
