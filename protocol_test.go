@@ -85,8 +85,10 @@ func TestConnectRoundTrip(t *testing.T) {
 }
 
 func TestDecodeInvalid(t *testing.T) {
-	if _, err := DecodePacket(""); err == nil {
-		t.Error("expected error for empty packet")
+	// "" is valid: it decodes to a CONNECT to "/" (Number("") === 0), matching
+	// socket.io-parser.
+	if p, err := DecodePacket(""); err != nil || p.Type != Connect || p.Namespace != "/" {
+		t.Errorf("DecodePacket(\"\") = %+v, %v; want a CONNECT to /", p, err)
 	}
 	if _, err := DecodePacket("9[]"); err == nil {
 		t.Error("expected error for invalid type")

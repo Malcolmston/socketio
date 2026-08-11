@@ -6,6 +6,86 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Security
+- **Namespace middleware that never calls `next()` is now a deny, not an admit**
+  (GHSA-fv7v-hmg8-9xmx). `Namespace.runMiddleware` used to return a `nil` error —
+  read by the caller as "accepted" — when a middleware returned without calling
+  `next`, so a silent auth reject (`return` without `next(err)`) admitted the
+  socket. It now leaves the handshake unanswered, matching upstream: the client
+  times out and no `connection` event fires. The safe default for a middleware
+  chain is deny.
+- **Out-of-range binary placeholders are rejected instead of handed to the app**
+  (GHSA-3r64-4j95-pf42). Binary reassembly (`Reconstruct`, `Decoder`, and the
+  server/client read paths) now rejects a `{"_placeholder":true,"num":N}` whose
+  index is negative or past the supplied buffers, and a `BINARY_EVENT`/
+  `BINARY_ACK` header declaring `0` attachments, both with an error wrapping
+  `ErrInvalidPacket` — matching socket.io-parser's "illegal attachments". A
+  remote peer can no longer make a handler receive a raw placeholder object where
+  it expected `[]byte`. `Reconstruct` now returns `(any, error)` (breaking).
+
+### Changed / Fixed (cross-language parity with socket.io@4.8.1)
+- **Ordered event delivery.** Inbound events for a socket are dispatched by a
+  single per-socket goroutine in arrival order, instead of one goroutine per
+  packet; back-to-back emits are no longer reordered.
+- **Acks only when handled.** The server and client now acknowledge an event
+  only when a handler returns a non-nil slice, mirroring "the callback was
+  invoked". An event with no handler, or a handler that returns `nil`, is no
+  longer auto-acked — so an ack timeout is reachable again.
+- **Reserved event names are refused.** `Socket.Emit` and `Client.Emit` return
+  `ErrReservedEvent` for `connect`/`disconnect`/`connect_error`/… instead of
+  sending them as application events.
+- **`Socket.OnDisconnecting`** — a pre-disconnect hook that fires while the
+  socket is still in its rooms, the equivalent of `socket.on("disconnecting")`.
+- **Client learns about namespace disconnects.** The client now handles a
+  server DISCONNECT packet: it fires `disconnect` with reason
+  `"io server disconnect"`, stops delivering further events for the namespace,
+  and no longer silently drops the packet.
+- **Client `disconnect` carries a reason** (`"io server disconnect"` /
+  `"transport close"`), matching socket.io-client.
+- **Decoder rewrites reassembled binary packets** to plain `EVENT`/`ACK` and
+  clears the attachment count, as socket.io-parser does.
+- **Wire encoding matches JSON.stringify:** HTML metacharacters (`<`, `>`, `&`)
+  are emitted raw, and negative zero is emitted as `0`.
+- **Stricter decode:** CONNECT/CONNECT_ERROR payloads are validated with
+  upstream's `isObject()` rule (arrays and `null` rejected); an empty frame `""`
+  decodes to a CONNECT to `/`; `engineio.DecodePayload("")` errors.
+- Binary attachments are only extracted from EVENT/ACK payloads; a `[]byte` in a
+  CONNECT/DISCONNECT/CONNECT_ERROR payload is serialised inline.
+- See `API-DEVIATIONS.md` for the five wire cases the port deliberately does not
+  match (object key order, invalid-type and lenient-base64 handling).
+
+### Added
+- `AllowedOrigins(...)` — builds an `Options.CheckOrigin` allowlist, the
+  equivalent of socket.io's `cors: { origin: [...] }`. Documented as the defense
+  against cross-site WebSocket hijacking (a WebSocket upgrade is not subject to
+  the same-origin policy).
+- `Options.MaxSessions` (default `DefaultMaxSessions` = 65536) caps concurrent
+  Engine.IO sessions; handshakes past the cap get `503`. Negative disables it.
+- `redis.ErrReplyTooLarge`, `redis.ErrClosed`, `redis.MaxBulkLength`,
+  `redis.MaxArrayLength`.
+- Hardening notes in `SECURITY.md` and `README.md`; fuzz targets for the
+  Socket.IO and Engine.IO decoders.
+
+### Fixed
+- A slow websocket client no longer stalls a room broadcast. Outbound frames go
+  through a bounded per-session queue drained by a dedicated writer goroutine;
+  a peer that stops reading has its session dropped instead of blocking the
+  fan-out to everyone else.
+- Binary packets buffered while a session was still polling were flushed with
+  `WriteText` on upgrade, downgrading a native binary frame to the `"b"`+base64
+  text form. They now keep their binary framing.
+- A session torn down while the Engine.IO upgrade probe was in flight left the
+  websocket (and its read goroutine) attached to a conn the server no longer
+  tracked. `attachWebSocket` now reports the failure and the socket is closed.
+- `Access-Control-Allow-Credentials: true` is no longer sent alongside an
+  arbitrary reflected `Origin`; it requires `CheckOrigin` to be configured. A
+  `Vary: Origin` response header was added.
+- A cluster broadcast whose `Publish` failed (Redis down or closed) was dropped
+  entirely — local sockets never saw it. It now degrades to local delivery.
+- The Redis RESP reader sized allocations directly from wire-declared lengths:
+  `$9223372036854775807` panicked in `make`, `*2000000000` requested 32 GB, and
+  `strconv` errors were discarded so `$abc` decoded as an empty bulk string.
+  Lengths are now bounded and validated, and array nesting is depth-limited.
 
 ## [0.4.0] - 2026-07-19
 ### Added

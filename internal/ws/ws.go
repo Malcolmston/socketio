@@ -19,8 +19,17 @@
 // Sec-WebSocket-Accept is the SHA-1/base64 digest of the client key plus the
 // RFC 6455 GUID. IsWebSocketUpgrade reports whether a request is a WebSocket
 // upgrade so callers can branch before attempting Upgrade. Dial performs the
-// mirror image: it opens a TCP connection, sends the GET upgrade request with a
-// random key, and verifies the server's accept value.
+// mirror image: it opens a TCP connection (wrapped in TLS for a wss:// or
+// https:// URL — see DialTLS for a custom *tls.Config), sends the GET upgrade
+// request with a random key, and verifies the server's accept value.
+//
+// Reads are bounded. A frame header declares its payload length before the
+// payload arrives, so an unbounded reader would allocate whatever a peer asks
+// for; ReadMessage instead rejects any frame — or any fragmented message whose
+// reassembly would grow — beyond the connection's read limit
+// (DefaultMaxMessageSize, adjustable with SetReadLimit) with ErrMessageTooLarge.
+// Control frames are held to the RFC's 125-byte, never-fragmented rule, and a
+// server-side Conn rejects the unmasked client frames RFC 6455 §5.1 forbids.
 //
 // Messages are exchanged with ReadMessage and WriteMessage (or the WriteText
 // convenience), which speak whole logical messages rather than raw frames.
@@ -47,6 +56,7 @@ import (
 	"bufio"
 	"crypto/rand"
 	"crypto/sha1"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -86,6 +96,22 @@ const (
 // ErrClosed is returned once the connection has been closed.
 var ErrClosed = errors.New("ws: connection closed")
 
+// ErrMessageTooLarge is returned by ReadMessage when a peer announces a frame,
+// or accumulates a fragmented message, larger than the connection's read limit.
+var ErrMessageTooLarge = errors.New("ws: message exceeds read limit")
+
+// DefaultMaxMessageSize is the read limit a Conn starts with: the largest
+// single frame, and the largest reassembled fragmented message, that
+// ReadMessage will accept. It matters because a frame header declares its
+// payload length in up to 64 bits *before* any of that payload is sent, so an
+// unbounded reader would allocate whatever an unauthenticated peer asks for
+// from 14 bytes of input. It defaults to 1 MiB, matching engine.io's
+// maxHttpBufferSize default; raise it with Conn.SetReadLimit.
+const DefaultMaxMessageSize = 1 << 20
+
+// maxControlFramePayload is the RFC 6455 §5.5 limit on control frame payloads.
+const maxControlFramePayload = 125
+
 // Conn is a WebSocket connection (server- or client-side).
 type Conn struct {
 	conn net.Conn
@@ -95,6 +121,11 @@ type Conn struct {
 	// client is true for connections created by Dial; client-to-server frames
 	// must be masked per RFC 6455.
 	client bool
+
+	// readLimit bounds the payload of a single frame and the total size of a
+	// reassembled fragmented message. Read only by the (single) reader
+	// goroutine, so it needs no lock beyond the atomic store in SetReadLimit.
+	readLimit atomic.Int64
 
 	writeMu sync.Mutex
 	closeMu sync.Mutex
@@ -145,8 +176,29 @@ func Upgrade(w http.ResponseWriter, r *http.Request) (*Conn, error) {
 		conn.Close()
 		return nil, err
 	}
-	return &Conn{conn: conn, br: rw.Reader, bw: rw.Writer}, nil
+	return newConn(conn, rw.Reader, rw.Writer, false), nil
 }
+
+// newConn builds a Conn with the default read limit applied.
+func newConn(nc net.Conn, br *bufio.Reader, bw *bufio.Writer, client bool) *Conn {
+	c := &Conn{conn: nc, br: br, bw: bw, client: client}
+	c.readLimit.Store(DefaultMaxMessageSize)
+	return c
+}
+
+// SetReadLimit sets the maximum payload size, in bytes, that ReadMessage will
+// accept for a single frame or for a fully reassembled fragmented message.
+// A value <= 0 restores DefaultMaxMessageSize. Exceeding the limit fails the
+// read with ErrMessageTooLarge instead of allocating what the peer asked for.
+func (c *Conn) SetReadLimit(n int64) {
+	if n <= 0 {
+		n = DefaultMaxMessageSize
+	}
+	c.readLimit.Store(n)
+}
+
+// ReadLimit returns the current read limit in bytes.
+func (c *Conn) ReadLimit() int64 { return c.readLimit.Load() }
 
 func acceptKey(key string) string {
 	h := sha1.New()
@@ -162,10 +214,23 @@ func (c *Conn) ReadMessage() (MessageType, []byte, error) {
 		msgType MessageType
 		started bool
 	)
+	limit := c.readLimit.Load()
+	if limit <= 0 {
+		// Zero-valued Conn (constructed outside Upgrade/Dial): fall back to the
+		// default rather than rejecting every frame.
+		limit = DefaultMaxMessageSize
+	}
 	for {
-		fin, opcode, data, err := c.readFrame()
+		fin, opcode, data, err := c.readFrame(limit)
 		if err != nil {
 			return 0, nil, err
+		}
+		// Guard the reassembly buffer too: a peer can otherwise stream an
+		// unbounded number of individually-legal continuation frames.
+		if opcode == opText || opcode == opBinary || opcode == opContinuation {
+			if int64(len(payload))+int64(len(data)) > limit {
+				return 0, nil, ErrMessageTooLarge
+			}
 		}
 		switch opcode {
 		case opPing:
@@ -204,8 +269,10 @@ func (c *Conn) ReadMessage() (MessageType, []byte, error) {
 	}
 }
 
-// readFrame reads a single frame, unmasking the client payload.
-func (c *Conn) readFrame() (fin bool, opcode byte, payload []byte, err error) {
+// readFrame reads a single frame, unmasking the client payload. limit bounds
+// the declared payload length: the length arrives before the payload does, so
+// it must be validated before it is used to size an allocation.
+func (c *Conn) readFrame(limit int64) (fin bool, opcode byte, payload []byte, err error) {
 	var header [2]byte
 	if _, err = io.ReadFull(c.br, header[:]); err != nil {
 		return
@@ -230,7 +297,32 @@ func (c *Conn) readFrame() (fin bool, opcode byte, payload []byte, err error) {
 		length = binary.BigEndian.Uint64(ext[:])
 	}
 
-	// RFC 6455: client-to-server frames MUST be masked.
+	isControl := opcode&0x08 != 0
+	if isControl {
+		// RFC 6455 §5.5: control frames carry at most 125 bytes and must not be
+		// fragmented. Enforcing this also keeps a ping echo from being used to
+		// make the server buffer and reflect a large payload.
+		if length > maxControlFramePayload {
+			err = errors.New("ws: control frame payload too long")
+			return
+		}
+		if !fin {
+			err = errors.New("ws: fragmented control frame")
+			return
+		}
+	} else if length > uint64(limit) {
+		err = ErrMessageTooLarge
+		return
+	}
+
+	// RFC 6455 §5.1: a server MUST close the connection on an unmasked frame
+	// from a client. Accepting one lets an attacker smuggle a WebSocket frame
+	// through a naive intermediary that only ever sees plain HTTP.
+	if !c.client && !masked {
+		err = errors.New("ws: unmasked client frame")
+		return
+	}
+
 	var maskKey [4]byte
 	if masked {
 		if _, err = io.ReadFull(c.br, maskKey[:]); err != nil {
@@ -324,16 +416,28 @@ func (c *Conn) writeFrame(opcode byte, data []byte) error {
 	return c.bw.Flush()
 }
 
-// Dial opens a client WebSocket connection to a ws:// or http:// URL. The
-// returned Conn masks outgoing frames as required for clients.
+// Dial opens a client WebSocket connection to a ws://, wss://, http:// or
+// https:// URL. The returned Conn masks outgoing frames as required for
+// clients. A wss:// or https:// URL is dialed over TLS, verified against the
+// system roots using the URL host as the server name; use DialTLS to supply a
+// custom *tls.Config.
 func Dial(rawURL string, header http.Header) (*Conn, error) {
+	return DialTLS(rawURL, header, nil)
+}
+
+// DialTLS is Dial with an explicit *tls.Config, used for secure (wss://)
+// endpoints that need a custom root pool, client certificate, or ServerName.
+// cfg is cloned before use and its ServerName is filled in from the URL host
+// when empty. It is ignored for plaintext (ws://) URLs.
+func DialTLS(rawURL string, header http.Header, cfg *tls.Config) (*Conn, error) {
 	u, err := neturl.Parse(rawURL)
 	if err != nil {
 		return nil, err
 	}
+	secure := u.Scheme == "wss" || u.Scheme == "https"
 	host := u.Host
 	if u.Port() == "" {
-		if u.Scheme == "wss" || u.Scheme == "https" {
+		if secure {
 			host += ":443"
 		} else {
 			host += ":80"
@@ -342,6 +446,24 @@ func Dial(rawURL string, header http.Header) (*Conn, error) {
 	conn, err := net.Dial("tcp", host)
 	if err != nil {
 		return nil, err
+	}
+	if secure {
+		// Without this a wss:// URL silently spoke cleartext to port 443 —
+		// the handshake either hung or failed, and any traffic that did flow
+		// would have been unencrypted.
+		tcfg := &tls.Config{MinVersion: tls.VersionTLS12}
+		if cfg != nil {
+			tcfg = cfg.Clone()
+		}
+		if tcfg.ServerName == "" {
+			tcfg.ServerName = u.Hostname()
+		}
+		tlsConn := tls.Client(conn, tcfg)
+		if err := tlsConn.Handshake(); err != nil {
+			conn.Close()
+			return nil, err
+		}
+		conn = tlsConn
 	}
 
 	var keyRaw [16]byte
@@ -384,7 +506,7 @@ func Dial(rawURL string, header http.Header) (*Conn, error) {
 		conn.Close()
 		return nil, errors.New("ws: bad Sec-WebSocket-Accept")
 	}
-	return &Conn{conn: conn, br: br, bw: bufio.NewWriter(conn), client: true}, nil
+	return newConn(conn, br, bufio.NewWriter(conn), true), nil
 }
 
 // Close sends a close frame and tears down the connection.

@@ -84,9 +84,29 @@ type Options struct {
 	// MaxPayload advertises the maximum HTTP payload size to clients.
 	MaxPayload int
 	// CheckOrigin, if set, authorizes cross-origin requests. When nil, all
-	// origins are allowed.
+	// origins are allowed — including cross-site WebSocket handshakes, which
+	// are not subject to the same-origin policy. Set it on any deployment where
+	// a connection carries ambient authority (cookies, session headers).
 	CheckOrigin func(r *http.Request) bool
+	// TrustProxy makes Socket.Handshake().Address honor the first entry of the
+	// X-Forwarded-For header. Leave it false unless a reverse proxy you control
+	// overwrites that header: it is otherwise fully client-controlled.
+	TrustProxy bool
+	// MaxSessions caps the number of concurrent Engine.IO sessions the server
+	// will hold. Every unauthenticated handshake request allocates a session and
+	// a heartbeat goroutine that survive until the ping timeout elapses, so
+	// without a cap a request flood grows the session map without bound. When
+	// the cap is reached, further handshakes are refused with 503 while existing
+	// sessions keep working. Zero selects DefaultMaxSessions; a negative value
+	// disables the cap entirely.
+	MaxSessions int
 }
+
+// DefaultMaxSessions is the concurrent-session cap applied when
+// Options.MaxSessions is zero. It is deliberately far above what a single
+// process is expected to serve: it exists to bound a handshake flood, not to
+// throttle legitimate traffic.
+const DefaultMaxSessions = 65536
 
 func (o *Options) withDefaults() {
 	if o.Path == "" {
@@ -100,6 +120,9 @@ func (o *Options) withDefaults() {
 	}
 	if o.MaxPayload == 0 {
 		o.MaxPayload = 1000000
+	}
+	if o.MaxSessions == 0 {
+		o.MaxSessions = DefaultMaxSessions
 	}
 }
 
@@ -182,14 +205,25 @@ func (s *Server) Sockets() []*Socket {
 // ServeHTTP implements http.Handler and dispatches Engine.IO transport
 // requests.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if s.opts.CheckOrigin != nil && r.Header.Get("Origin") != "" && !s.opts.CheckOrigin(r) {
+	origin := r.Header.Get("Origin")
+	if s.opts.CheckOrigin != nil && origin != "" && !s.opts.CheckOrigin(r) {
 		http.Error(w, "origin not allowed", http.StatusForbidden)
 		return
 	}
 	// CORS: reflect the origin so browser clients can connect.
-	if origin := r.Header.Get("Origin"); origin != "" {
+	//
+	// Credentials (cookies, HTTP auth) are only allowed for an origin the
+	// application has vetted. Reflecting an arbitrary origin *and* setting
+	// Access-Control-Allow-Credentials would let any web page read this
+	// server's polling responses with the visitor's ambient credentials, which
+	// is the same class of bug as a wildcard CORS policy. Node's socket.io
+	// likewise sends no CORS headers until `cors` is configured.
+	if origin != "" {
 		w.Header().Set("Access-Control-Allow-Origin", origin)
-		w.Header().Set("Access-Control-Allow-Credentials", "true")
+		w.Header().Add("Vary", "Origin") // Add, not Set: don't clobber a Vary a wrapper set
+		if s.opts.CheckOrigin != nil {
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+		}
 	}
 	if r.Method == http.MethodOptions {
 		w.Header().Set("Access-Control-Allow-Methods", "GET,POST")
@@ -303,7 +337,20 @@ func (s *Server) getConn(sid string) *conn {
 	return s.conns[sid]
 }
 
-// newConn creates and registers a new engine.io session.
+// newConnFrom creates a session and captures the handshake details of the HTTP
+// request that established it, so Socket.Handshake can report them later. It
+// returns nil when Options.MaxSessions is already reached.
+func (s *Server) newConnFrom(r *http.Request) *conn {
+	c := s.newConn()
+	if c == nil {
+		return nil
+	}
+	c.handshake = newHandshake(r, nil, s.opts.TrustProxy)
+	return c
+}
+
+// newConn creates and registers a new engine.io session, or returns nil when
+// the server is already holding Options.MaxSessions sessions.
 func (s *Server) newConn() *conn {
 	c := &conn{
 		sid:      newID(),
@@ -312,6 +359,10 @@ func (s *Server) newConn() *conn {
 		lastPong: time.Now(),
 	}
 	s.mu.Lock()
+	if s.opts.MaxSessions > 0 && len(s.conns) >= s.opts.MaxSessions {
+		s.mu.Unlock()
+		return nil
+	}
 	s.conns[c.sid] = c
 	s.mu.Unlock()
 	return c

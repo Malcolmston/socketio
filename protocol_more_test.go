@@ -186,7 +186,10 @@ func TestDeconstructReconstruct(t *testing.T) {
 		t.Fatal("rewritten payload should not contain raw []byte")
 	}
 
-	back := Reconstruct(rewritten, buffers)
+	back, err := Reconstruct(rewritten, buffers)
+	if err != nil {
+		t.Fatalf("Reconstruct: %v", err)
+	}
 	arr, ok := back.([]any)
 	if !ok || len(arr) != 3 {
 		t.Fatalf("reconstructed = %v", back)
@@ -269,18 +272,21 @@ func TestReconstructAsIntTypes(t *testing.T) {
 	buffers := [][]byte{{0xaa}, {0xbb}}
 	for _, num := range []any{int(0), int64(1), float64(1)} {
 		data := map[string]any{"_placeholder": true, "num": num}
-		got := reconstruct(data, buffers)
+		got, err := reconstruct(data, buffers)
+		if err != nil {
+			t.Fatalf("num=%v (%T): %v", num, num, err)
+		}
 		b, ok := got.([]byte)
 		if !ok {
 			t.Fatalf("num=%v (%T): got %v, want []byte", num, num, got)
 		}
 		_ = b
 	}
-	// Out-of-range placeholder is left untouched.
+	// Out-of-range placeholder is rejected (upstream throws "illegal
+	// attachments" rather than handing the raw placeholder to the application).
 	data := map[string]any{"_placeholder": true, "num": 99}
-	got := reconstruct(data, buffers)
-	if _, ok := got.([]byte); ok {
-		t.Fatal("out-of-range placeholder should not resolve to a buffer")
+	if _, err := reconstruct(data, buffers); err == nil {
+		t.Fatal("out-of-range placeholder should be rejected")
 	}
 }
 

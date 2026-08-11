@@ -6,5 +6,6 @@
   "upstreamCasesSynced": 20,
   "gapsFound": 4,
   "gapsClosed": 4,
-  "asOf": "2026-07-18"
+  "asOf": "2026-08-05",
+  "notes": "Wire-protocol parity with socket.io-parser and engine.io-parser is covered by known-answer tests transcribed from the upstream suites (protocol_parity_test.go, engineio/parser_parity_test.go). Deliberate deviations from the Node defaults, all in the safe direction: Handshake.Address ignores X-Forwarded-For unless Options.TrustProxy is set; Access-Control-Allow-Credentials requires Options.CheckOrigin; concurrent sessions are capped by Options.MaxSessions."
 }

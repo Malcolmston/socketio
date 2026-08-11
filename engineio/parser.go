@@ -152,7 +152,11 @@ func EncodePayload(packets []Packet) string {
 // DecodePayload splits a polling payload into its constituent packets.
 func DecodePayload(payload string) ([]Packet, error) {
 	if payload == "" {
-		return nil, nil
+		// An empty polling body is malformed: engine.io-parser's decodePayload
+		// yields a single "parser error" packet for "". Returning an empty packet
+		// list with no error diverged from the reference decoder (and let a
+		// caller treat a truncated/empty POST body as a valid, empty batch).
+		return nil, ErrEmptyPacket
 	}
 	parts := strings.Split(payload, separator)
 	packets := make([]Packet, 0, len(parts))

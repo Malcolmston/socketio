@@ -19,16 +19,29 @@ type Socket struct {
 	namespace *Namespace
 	conn      *conn
 	auth      any
+	handshake *Handshake
 
-	mu                 sync.Mutex
-	handlers           map[string][]EventHandler
-	rooms              map[string]struct{}
-	disconnectHandlers []func(reason string)
-	ackCounter         uint64
-	pendingAcks        map[uint64]func([]any)
-	disconnected       bool
-	data               map[string]any
-	anyHandlers        []func(event string, args []any)
+	mu                    sync.Mutex
+	handlers              map[string][]EventHandler
+	rooms                 map[string]struct{}
+	disconnectHandlers    []func(reason string)
+	disconnectingHandlers []func(reason string)
+	ackCounter            uint64
+	pendingAcks           map[uint64]func([]any)
+	disconnected          bool
+	disconnecting         bool
+	data                  map[string]any
+	anyHandlers           []func(event string, args []any)
+
+	// inbox is the socket's ordered inbound-event queue. Every EVENT/BINARY_EVENT
+	// for this socket is appended here and dispatched by a single goroutine, so
+	// handlers run in the order the client emitted them — Socket.IO guarantees
+	// ordered delivery within a socket. Dispatching each packet on its own
+	// goroutine (as this used to) reordered back-to-back emits arbitrarily.
+	inboxMu   sync.Mutex
+	inboxCond *sync.Cond
+	inbox     []Packet
+	inboxStop bool
 }
 
 // ID returns the socket's unique identifier.
@@ -87,6 +100,14 @@ func (s *Socket) Data() map[string]any {
 	return out
 }
 
+// Handshake returns the details of the HTTP request that established this
+// socket's session — headers, query string, address, TLS flag, and the auth
+// payload sent with CONNECT — the equivalent of socket.handshake in the
+// JavaScript API. It is nil only for sockets created outside an HTTP request
+// (in tests). The returned value is a per-socket snapshot; mutating it does not
+// affect the session or other namespaces on it.
+func (s *Socket) Handshake() *Handshake { return s.handshake }
+
 // Namespace returns the namespace this socket belongs to.
 func (s *Socket) Namespace() *Namespace { return s.namespace }
 
@@ -114,38 +135,145 @@ func (s *Socket) OnDisconnect(fn func(reason string)) *Socket {
 	return s
 }
 
-// Emit sends an event to this socket.
+// OnDisconnecting registers a callback invoked as the socket begins to
+// disconnect, before it has left its rooms — the equivalent of
+// socket.on("disconnecting"). Unlike OnDisconnect, the socket's Rooms() are
+// still populated when this fires, so a handler can record which rooms the
+// socket was in on its way out. It runs with the same reason string that the
+// subsequent disconnect carries.
+func (s *Socket) OnDisconnecting(fn func(reason string)) *Socket {
+	s.mu.Lock()
+	s.disconnectingHandlers = append(s.disconnectingHandlers, fn)
+	s.mu.Unlock()
+	return s
+}
+
+// Emit sends an event to this socket. Emitting a reserved Socket.IO event name
+// (connect, connect_error, disconnect, disconnecting, ...) returns
+// ErrReservedEvent without sending anything, matching the JavaScript server,
+// which throws for those names — they are the library's own lifecycle signals
+// and must not be spoofed as application events.
 func (s *Socket) Emit(event string, args ...any) error {
+	if IsReservedEvent(event) {
+		return ErrReservedEvent
+	}
 	return s.conn.sendPacket(newEvent(s.namespace.name, event, args, nil))
 }
 
+// startDispatcher launches the single goroutine that delivers this socket's
+// inbound events in order. It is started once, when the socket is created.
+func (s *Socket) startDispatcher() {
+	s.inboxCond = sync.NewCond(&s.inboxMu)
+	go s.dispatchLoop()
+}
+
+// enqueue appends an inbound event to the ordered queue. It never blocks the
+// transport read loop: a handler that blocks (for example on EmitAck) stalls
+// only this socket's own queue, while the ACK it awaits still arrives on the
+// read loop and resolves independently.
+func (s *Socket) enqueue(pkt Packet) {
+	s.inboxMu.Lock()
+	if s.inboxStop {
+		s.inboxMu.Unlock()
+		return
+	}
+	s.inbox = append(s.inbox, pkt)
+	s.inboxCond.Signal()
+	s.inboxMu.Unlock()
+}
+
+func (s *Socket) dispatchLoop() {
+	for {
+		s.inboxMu.Lock()
+		for len(s.inbox) == 0 && !s.inboxStop {
+			s.inboxCond.Wait()
+		}
+		if len(s.inbox) == 0 && s.inboxStop {
+			s.inboxMu.Unlock()
+			return
+		}
+		pkt := s.inbox[0]
+		s.inbox = s.inbox[1:]
+		s.inboxMu.Unlock()
+		s.dispatch(pkt)
+	}
+}
+
+func (s *Socket) stopDispatcher() {
+	s.inboxMu.Lock()
+	s.inboxStop = true
+	if s.inboxCond != nil {
+		s.inboxCond.Signal()
+	}
+	s.inboxMu.Unlock()
+}
+
 // EmitWithAck sends an event and invokes ackFn with the client's acknowledgement
-// arguments.
+// arguments. If the packet cannot be sent the pending callback is discarded and
+// the send error is returned; ackFn is not invoked.
 func (s *Socket) EmitWithAck(event string, ackFn func(args []any), args ...any) error {
+	id := s.registerAck(ackFn)
+	if err := s.conn.sendPacket(newEvent(s.namespace.name, event, args, &id)); err != nil {
+		s.cancelAck(id)
+		return err
+	}
+	return nil
+}
+
+// registerAck reserves an acknowledgement id for a callback.
+func (s *Socket) registerAck(ackFn func(args []any)) uint64 {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	id := s.ackCounter
 	s.ackCounter++
 	s.pendingAcks[id] = ackFn
+	return id
+}
+
+// cancelAck drops a pending acknowledgement callback that will never fire.
+func (s *Socket) cancelAck(id uint64) {
+	s.mu.Lock()
+	delete(s.pendingAcks, id)
 	s.mu.Unlock()
-	return s.conn.sendPacket(newEvent(s.namespace.name, event, args, &id))
+}
+
+// PendingAcks reports how many acknowledgements this socket is still waiting
+// for. It is primarily useful in tests and for instrumentation.
+func (s *Socket) PendingAcks() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.pendingAcks)
 }
 
 // EmitAck sends an event and blocks until the client acknowledges it or timeout
-// elapses, returning the acknowledgement arguments.
+// elapses, returning the acknowledgement arguments. On timeout it returns
+// ErrAckTimeout and forgets the acknowledgement, so a client that never answers
+// (or answers late) cannot make the socket accumulate pending callbacks.
 func (s *Socket) EmitAck(event string, timeout time.Duration, args ...any) ([]any, error) {
 	ch := make(chan []any, 1)
-	if err := s.EmitWithAck(event, func(reply []any) { ch <- reply }, args...); err != nil {
+	id := s.registerAck(func(reply []any) { ch <- reply })
+	if err := s.conn.sendPacket(newEvent(s.namespace.name, event, args, &id)); err != nil {
+		s.cancelAck(id)
 		return nil, err
 	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
 	case reply := <-ch:
 		return reply, nil
-	case <-time.After(timeout):
-		return nil, errAckTimeout
+	case <-timer.C:
+		s.cancelAck(id)
+		return nil, ErrAckTimeout
 	}
 }
 
-var errAckTimeout = errors.New("socketio: ack timeout")
+// ErrAckTimeout is returned by EmitAck when the client does not acknowledge the
+// event within the supplied timeout.
+var ErrAckTimeout = errors.New("socketio: ack timeout")
+
+// errAckTimeout is the historical unexported alias for ErrAckTimeout.
+var errAckTimeout = ErrAckTimeout
 
 // dispatch delivers an inbound event to the registered handlers, replying with
 // an ACK when the packet requested one.
@@ -166,16 +294,19 @@ func (s *Socket) dispatch(pkt Packet) {
 			ackData = reply
 		}
 	}
-	if pkt.ID != nil {
-		reply := ackData
-		if reply == nil {
-			reply = []any{}
-		}
+	// Acknowledge only when a handler actually produced an ack (returned a
+	// non-nil slice — the port's equivalent of a JavaScript handler invoking its
+	// callback). Upstream never acks an event that no handler handled, nor one
+	// whose handler ignored its callback; auto-acking made an ack timeout
+	// unreachable and erased the difference between "handled, nothing to report"
+	// and "no handler at all". A handler that wants to ack with no data returns
+	// an empty (non-nil) slice.
+	if pkt.ID != nil && ackData != nil {
 		_ = s.conn.sendPacket(Packet{
 			Type:      Ack,
 			Namespace: s.namespace.name,
 			ID:        pkt.ID,
-			Data:      reply,
+			Data:      ackData,
 		})
 	}
 }
@@ -238,6 +369,7 @@ func (s *Socket) Broadcast() *BroadcastOperator {
 
 // Disconnect closes the socket, optionally closing the underlying transport.
 func (s *Socket) Disconnect(closeTransport bool) {
+	s.fireDisconnecting("server namespace disconnect")
 	_ = s.conn.sendPacket(Packet{Type: Disconnect, Namespace: s.namespace.name})
 	s.conn.mu.Lock()
 	delete(s.conn.sockets, s.namespace.name)
@@ -249,7 +381,24 @@ func (s *Socket) Disconnect(closeTransport bool) {
 	}
 }
 
-// fireDisconnect notifies disconnect handlers exactly once.
+// fireDisconnecting notifies "disconnecting" handlers exactly once, while the
+// socket is still a member of its rooms.
+func (s *Socket) fireDisconnecting(reason string) {
+	s.mu.Lock()
+	if s.disconnecting {
+		s.mu.Unlock()
+		return
+	}
+	s.disconnecting = true
+	handlers := append([]func(reason string){}, s.disconnectingHandlers...)
+	s.mu.Unlock()
+	for _, h := range handlers {
+		h(reason)
+	}
+}
+
+// fireDisconnect notifies disconnect handlers exactly once. It also stops the
+// socket's ordered dispatcher goroutine, since no further events will arrive.
 func (s *Socket) fireDisconnect(reason string) {
 	s.mu.Lock()
 	if s.disconnected {
@@ -259,6 +408,7 @@ func (s *Socket) fireDisconnect(reason string) {
 	s.disconnected = true
 	handlers := append([]func(reason string){}, s.disconnectHandlers...)
 	s.mu.Unlock()
+	s.stopDispatcher()
 	for _, h := range handlers {
 		h(reason)
 	}

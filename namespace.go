@@ -1,6 +1,9 @@
 package socketio
 
-import "sync"
+import (
+	"errors"
+	"sync"
+)
 
 // Namespace is a communication channel that partitions a Socket.IO server. Each
 // namespace has its own set of connected sockets, rooms, and connection
@@ -35,27 +38,42 @@ func (ns *Namespace) Use(fn func(socket *Socket, next func(err error))) *Namespa
 	return ns
 }
 
-// runMiddleware executes the namespace middleware chain for a socket, returning
-// the first error raised (or nil when all middleware pass).
+// errMiddlewareSilent marks a middleware chain that terminated without the
+// middleware calling next() at all — neither next(nil) nor next(err). Upstream
+// leaves such a handshake unanswered (the client eventually times out); the
+// caller treats this sentinel as "do not admit the socket and do not reply",
+// distinct from an explicit rejection, which sends a CONNECT_ERROR.
+var errMiddlewareSilent = errors.New("socketio: middleware did not call next")
+
+// runMiddleware executes the namespace middleware chain for a socket. It returns
+// nil when every middleware called next(nil); the middleware's error when one
+// called next(err); or errMiddlewareSilent when a middleware returned without
+// calling next at all. A silent return must NOT be treated as acceptance — that
+// would admit an unauthenticated socket whenever an auth middleware chose to
+// reject by returning without calling next(err), the safe-by-default deny shape.
 func (ns *Namespace) runMiddleware(s *Socket) error {
 	ns.mu.RLock()
 	chain := append([]func(*Socket, func(error)){}, ns.middleware...)
 	ns.mu.RUnlock()
 
-	var runErr error
 	for _, mw := range chain {
 		called := false
+		var runErr error
 		mw(s, func(err error) {
 			called = true
 			runErr = err
 		})
-		if !called || runErr != nil {
-			// A middleware that never calls next() halts the chain; a non-nil
-			// error rejects the connection.
-			break
+		if !called {
+			// The middleware never continued the chain: deny, and do not answer
+			// the handshake. Returning nil here (as this used to) told the caller
+			// the socket was accepted — an authentication bypass.
+			return errMiddlewareSilent
+		}
+		if runErr != nil {
+			return runErr
 		}
 	}
-	return runErr
+	return nil
 }
 
 func newNamespace(server *Server, name string) *Namespace {
@@ -87,12 +105,14 @@ func (ns *Namespace) add(c *conn, _ string, auth any) *Socket {
 		namespace:   ns,
 		conn:        c,
 		auth:        auth,
+		handshake:   c.handshake.withAuth(auth),
 		handlers:    make(map[string][]EventHandler),
 		rooms:       make(map[string]struct{}),
 		pendingAcks: make(map[uint64]func([]any)),
 	}
 	ns.adapter.Add(s.id, s)
 	ns.join(s, s.id) // implicit room named after the socket id
+	s.startDispatcher()
 	return s
 }
 

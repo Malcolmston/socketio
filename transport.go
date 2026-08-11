@@ -42,7 +42,12 @@ func writePayload(w http.ResponseWriter, packets []engineio.Packet) {
 func (s *Server) handlePolling(w http.ResponseWriter, r *http.Request, sid string) {
 	if sid == "" {
 		// New session handshake.
-		c := s.newConn()
+		c := s.newConnFrom(r)
+		if c == nil {
+			// Session cap reached; refuse rather than grow the session map.
+			http.Error(w, "too many sessions", http.StatusServiceUnavailable)
+			return
+		}
 		c.startPing()
 		writePayload(w, []engineio.Packet{s.openPacket(c, []string{"websocket"})})
 		return
@@ -139,11 +144,16 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, sid str
 
 	if sid == "" {
 		// Fresh websocket connection: create the session and send OPEN.
-		c := s.newConn()
-		c.mu.Lock()
-		c.wsConn = wsc
-		c.mu.Unlock()
-		_ = wsc.WriteText(s.openPacket(c, []string{}).Encode())
+		c := s.newConnFrom(r)
+		if c == nil {
+			_ = wsc.Close()
+			return
+		}
+		if !c.attachWebSocket(wsc) {
+			_ = wsc.Close()
+			return
+		}
+		c.send(s.openPacket(c, []string{}))
 		c.startPing()
 		c.readLoop(wsc)
 		return
@@ -159,7 +169,13 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, sid str
 		_ = wsc.Close()
 		return
 	}
-	c.attachWebSocket(wsc)
+	// attachWebSocket reports false when the session was torn down while the
+	// probe was in flight; without that check the websocket (and this readLoop)
+	// would be owned by a session no longer in the server's map.
+	if !c.attachWebSocket(wsc) {
+		_ = wsc.Close()
+		return
+	}
 	c.readLoop(wsc)
 }
 

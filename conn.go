@@ -1,6 +1,7 @@
 package socketio
 
 import (
+	"errors"
 	"sync"
 	"time"
 
@@ -14,9 +15,24 @@ import (
 type conn struct {
 	sid    string
 	server *Server
+	// handshake describes the HTTP request that opened this session. It is set
+	// once at creation and never mutated, so it needs no lock.
+	handshake *Handshake
 
-	mu         sync.Mutex
-	wsConn     *ws.Conn
+	mu     sync.Mutex
+	wsConn *ws.Conn
+	// wsOut is the bounded outbound queue for the websocket transport, drained
+	// by a single writeLoop goroutine. Writes to a socket are not instantaneous:
+	// a client that stops reading eventually fills its TCP window, and a
+	// synchronous write from a room broadcast would then block the broadcasting
+	// goroutine (and every socket after it in the fan-out) for as long as the
+	// slow peer cared to stall. Queuing decouples the broadcast from the peer;
+	// when the queue fills, the session is dropped rather than the broadcast.
+	//
+	// It is only ever sent on, and only ever closed, while holding mu with
+	// closed still false, so a concurrent cleanup cannot close it out from under
+	// a sender.
+	wsOut      chan engineio.Packet
 	outbuf     []engineio.Packet
 	pollWaiter chan []engineio.Packet
 	sockets    map[string]*Socket // socket.io sockets by namespace name
@@ -36,7 +52,18 @@ type pendingBinary struct {
 	packet  Packet
 	buffers [][]byte
 	need    int
+	// bytes is the running total of buffered attachment bytes, used to bound
+	// how much an unfinished binary packet can make the server hold.
+	bytes int
 }
+
+// maxOutboundBuffer bounds how many Engine.IO packets a session may accumulate
+// while no polling request is outstanding. A client that opens a session and
+// then never polls (or stops polling while the server keeps broadcasting to it)
+// would otherwise grow this buffer without limit. Once the cap is reached the
+// session is treated as dead and torn down, matching the "client is too slow,
+// drop it" behavior of engine.io's write buffer.
+const maxOutboundBuffer = 2048
 
 // send queues or writes an Engine.IO packet, depending on the active transport.
 func (c *conn) send(p engineio.Packet) {
@@ -45,15 +72,26 @@ func (c *conn) send(p engineio.Packet) {
 		c.mu.Unlock()
 		return
 	}
-	if c.wsConn != nil {
-		w := c.wsConn
-		c.mu.Unlock()
-		if p.Binary != nil {
-			// Binary attachments travel as native websocket binary frames.
-			_ = w.WriteMessage(ws.BinaryMessage, p.Binary)
-		} else {
-			_ = w.WriteText(p.Encode())
+	if c.wsOut != nil {
+		// Non-blocking enqueue under mu: the channel is buffered, so this never
+		// blocks, which is what keeps a stalled peer from holding the lock (or
+		// the caller's goroutine) hostage.
+		select {
+		case c.wsOut <- p:
+			c.mu.Unlock()
+		default:
+			// The peer has not drained maxOutboundBuffer packets. Drop the
+			// session instead of stalling every other recipient of a broadcast.
+			c.mu.Unlock()
+			go c.server.removeConn(c)
 		}
+		return
+	}
+	if len(c.outbuf) >= maxOutboundBuffer {
+		// The peer is not draining its polling transport. Drop the session
+		// instead of buffering for it forever.
+		c.mu.Unlock()
+		go c.server.removeConn(c)
 		return
 	}
 	c.outbuf = append(c.outbuf, p)
@@ -148,6 +186,15 @@ func (c *conn) handleBinaryAttachment(buf []byte) {
 		c.mu.Unlock()
 		return
 	}
+	if pb.bytes+len(buf) > c.server.opts.MaxPayload {
+		// A BINARY_EVENT may declare up to MaxAttachments buffers; cap the
+		// total bytes held for it so a client cannot make the server buffer
+		// unbounded data by declaring many attachments and dribbling them in.
+		c.pendingBin = nil
+		c.mu.Unlock()
+		return
+	}
+	pb.bytes += len(buf)
 	pb.buffers = append(pb.buffers, buf)
 	if len(pb.buffers) < pb.need {
 		c.mu.Unlock()
@@ -157,7 +204,14 @@ func (c *conn) handleBinaryAttachment(buf []byte) {
 	c.mu.Unlock()
 
 	pkt := pb.packet
-	pkt.Data = reconstruct(pkt.Data, pb.buffers)
+	data, err := reconstruct(pkt.Data, pb.buffers)
+	if err != nil {
+		// A malformed binary frame (an out-of-range placeholder) is dropped
+		// rather than dispatched with a raw placeholder object in its payload.
+		return
+	}
+	pkt.Data = data
+	pkt.attachments = 0
 	if pkt.Type == BinaryEvent {
 		pkt.Type = Event
 		c.handleEvent(pkt)
@@ -168,6 +222,22 @@ func (c *conn) handleBinaryAttachment(buf []byte) {
 }
 
 func (c *conn) handleConnect(pkt Packet) {
+	// A repeated CONNECT for a namespace this session is already joined to is a
+	// no-op: previously each one minted a fresh Socket and overwrote the map
+	// entry, orphaning the old socket in the namespace adapter (and letting a
+	// client grow that adapter without bound by spamming CONNECT).
+	c.mu.Lock()
+	existing := c.sockets[pkt.Namespace]
+	c.mu.Unlock()
+	if existing != nil {
+		_ = c.sendPacket(Packet{
+			Type:      Connect,
+			Namespace: pkt.Namespace,
+			Data:      map[string]any{"sid": existing.id},
+		})
+		return
+	}
+
 	ns := c.server.namespace(pkt.Namespace)
 	if ns == nil {
 		_ = c.sendPacket(Packet{
@@ -179,9 +249,18 @@ func (c *conn) handleConnect(pkt Packet) {
 	}
 	socket := ns.add(c, pkt.Namespace, pkt.Data)
 
-	// Run connection middleware; a raised error rejects the connection.
+	// Run connection middleware. An explicit rejection (next(err)) answers with a
+	// CONNECT_ERROR; a middleware that returns without calling next at all leaves
+	// the handshake unanswered, exactly as upstream does — the client times out
+	// and no socket is admitted. Never fall through to acceptance in either case.
 	if err := ns.runMiddleware(socket); err != nil {
+		socket.stopDispatcher()
 		ns.remove(socket)
+		if errors.Is(err, errMiddlewareSilent) {
+			// Deny silently: send nothing, so the client's connect attempt times
+			// out rather than being admitted.
+			return
+		}
 		_ = c.sendPacket(Packet{
 			Type:      ConnectError,
 			Namespace: pkt.Namespace,
@@ -190,7 +269,15 @@ func (c *conn) handleConnect(pkt Packet) {
 		return
 	}
 
+	// Re-check under the lock: two CONNECT packets for the same namespace can be
+	// in flight concurrently (polling POSTs are independent HTTP requests), and
+	// the loser must not orphan its socket in the adapter.
 	c.mu.Lock()
+	if won := c.sockets[pkt.Namespace]; won != nil {
+		c.mu.Unlock()
+		ns.remove(socket)
+		return
+	}
 	c.sockets[pkt.Namespace] = socket
 	c.mu.Unlock()
 
@@ -208,10 +295,11 @@ func (c *conn) handleEvent(pkt Packet) {
 	socket := c.sockets[pkt.Namespace]
 	c.mu.Unlock()
 	if socket != nil {
-		// Dispatch off the transport read loop so a handler may block on an
-		// acknowledgement (EmitAck) without preventing the loop from reading
-		// the very ACK it is waiting for.
-		go socket.dispatch(pkt)
+		// Hand the event to the socket's ordered dispatcher rather than spawning
+		// a goroutine per packet: Socket.IO guarantees in-order delivery within a
+		// socket, and enqueue never blocks this read loop, so a handler that
+		// blocks on EmitAck still lets the loop read the ACK it awaits.
+		socket.enqueue(pkt)
 	}
 }
 
@@ -230,6 +318,7 @@ func (c *conn) handleDisconnect(pkt Packet) {
 	delete(c.sockets, pkt.Namespace)
 	c.mu.Unlock()
 	if socket != nil {
+		socket.fireDisconnecting("client namespace disconnect")
 		socket.namespace.remove(socket)
 		socket.fireDisconnect("client namespace disconnect")
 	}
@@ -278,16 +367,24 @@ func (c *conn) cleanup() {
 	}
 	c.sockets = map[string]*Socket{}
 	wsc := c.wsConn
+	out := c.wsOut
+	c.wsOut = nil
 	waiter := c.pollWaiter
 	c.pollWaiter = nil
 	stop := c.stopPing
 	c.mu.Unlock()
 
 	for _, s := range sockets {
+		s.fireDisconnecting("transport close")
 		s.namespace.remove(s)
 		s.fireDisconnect("transport close")
 	}
-	if wsc != nil {
+	if out != nil {
+		// Hand the close over to writeLoop: it flushes whatever is still queued
+		// (notably the DISCONNECT packet a server-side disconnect just sent)
+		// before tearing the socket down, then closes wsc and exits.
+		close(out)
+	} else if wsc != nil {
 		_ = wsc.Close()
 	}
 	if waiter != nil {
@@ -302,15 +399,37 @@ func (c *conn) cleanup() {
 }
 
 // attachWebSocket switches this session to the websocket transport, releasing
-// any pending polling request and flushing buffered packets.
-func (c *conn) attachWebSocket(wsc *ws.Conn) {
+// any pending polling request and flushing buffered packets. It reports whether
+// the session accepted the transport: a session that was torn down while the
+// upgrade probe was in flight returns false, and the caller must close wsc
+// itself — otherwise the connection (and the readLoop goroutine pumping it)
+// would be retained by a session nothing can reach.
+func (c *conn) attachWebSocket(wsc *ws.Conn) bool {
 	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return false
+	}
 	c.wsConn = wsc
+	c.wsOut = make(chan engineio.Packet, maxOutboundBuffer)
+	out := c.wsOut
 	waiter := c.pollWaiter
 	c.pollWaiter = nil
 	buf := c.outbuf
 	c.outbuf = nil
+	// Packets buffered by the polling transport are re-queued ahead of anything
+	// new, preserving order across the upgrade. Encoding happens in writeLoop so
+	// binary attachments keep their native binary frames — flushing them here
+	// with WriteText used to base64-mangle every buffered binary packet.
+	for _, p := range buf {
+		select {
+		case out <- p:
+		default:
+		}
+	}
 	c.mu.Unlock()
+
+	go c.writeLoop(wsc, out)
 
 	if waiter != nil {
 		// Release the outstanding poll with a noop so it returns promptly.
@@ -319,8 +438,28 @@ func (c *conn) attachWebSocket(wsc *ws.Conn) {
 		default:
 		}
 	}
-	for _, p := range buf {
-		_ = wsc.WriteText(p.Encode())
+	return true
+}
+
+// writeLoop serializes all websocket writes for a session. It owns wsc: it
+// drains out (which cleanup closes) and then closes the connection, so queued
+// packets are flushed before the transport goes away.
+func (c *conn) writeLoop(wsc *ws.Conn, out chan engineio.Packet) {
+	defer wsc.Close()
+	for p := range out {
+		var err error
+		if p.Binary != nil {
+			// Binary attachments travel as native websocket binary frames.
+			err = wsc.WriteMessage(ws.BinaryMessage, p.Binary)
+		} else {
+			err = wsc.WriteText(p.Encode())
+		}
+		if err != nil {
+			// The transport is gone; tear the session down and stop writing.
+			// cleanup closes out, which this loop has already abandoned.
+			go c.server.removeConn(c)
+			return
+		}
 	}
 }
 

@@ -13,7 +13,7 @@
 [![Code Size](https://img.shields.io/github/languages/code-size/Malcolmston/socket.io)](https://github.com/Malcolmston/socket.io)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
-[![Docs](https://img.shields.io/badge/docs-pages-2f9bff)](https://malcolmston.github.io/socket.io/)
+[![Docs](https://img.shields.io/badge/docs-vercel-2f9bff)](https://go-malcolms-projects-18e573c3.vercel.app/lib/socket.io)
 
 **Node's Socket.IO, for Go.**
 
@@ -93,6 +93,38 @@ io.To("room").Emit("event", data)    // broadcast to a room
 
 An `*socketio.Server` is an `http.Handler`; mount it at `socketio.DefaultPath`
 (`/socket.io/`).
+
+### Hardening a public deployment
+
+Four `Options` matter once the server faces the internet:
+
+```go
+io := socketio.New(socketio.Options{
+	// Reject cross-site WebSocket handshakes. A WebSocket upgrade is not
+	// subject to the same-origin policy and triggers no CORS preflight, so
+	// without this any page can open an authenticated socket to you.
+	// Setting it also enables Access-Control-Allow-Credentials, which is
+	// withheld while every origin is accepted.
+	CheckOrigin: socketio.AllowedOrigins("https://app.example.com"),
+
+	// Believe X-Forwarded-For only behind a proxy that overwrites it.
+	// Otherwise Handshake().Address is the real socket peer.
+	TrustProxy: false,
+
+	// Cap concurrent Engine.IO sessions (default DefaultMaxSessions).
+	// Negative disables the cap.
+	MaxSessions: 65536,
+
+	// Bounds POSTed polling bodies and buffered binary attachments.
+	MaxPayload: 1_000_000,
+})
+```
+
+Independently of configuration, the server bounds what a peer can make it
+allocate: WebSocket frames and reassembled fragmented messages are limited to
+1 MiB, a `BINARY_EVENT` may declare at most `MaxAttachments` (1024) buffers, and
+a client that stops reading has its outbound queue capped rather than being
+allowed to stall a room broadcast.
 
 ### Socket
 

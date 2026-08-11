@@ -102,8 +102,11 @@ func TestDecoderRoundTripBinary(t *testing.T) {
 	if pkt == nil {
 		t.Fatal("packet should complete on the last attachment")
 	}
-	if pkt.Type != BinaryEvent {
-		t.Fatalf("type = %v, want BinaryEvent", pkt.Type)
+	// A reassembled binary packet is rewritten to a plain EVENT (matching
+	// socket.io-parser's Decoder, which promotes BINARY_EVENT→EVENT once every
+	// attachment has arrived).
+	if pkt.Type != Event {
+		t.Fatalf("type = %v, want Event", pkt.Type)
 	}
 	args := pkt.Args()
 	if len(args) != 2 {

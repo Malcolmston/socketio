@@ -40,14 +40,44 @@ func TestNewHandshakeBasic(t *testing.T) {
 	}
 }
 
+// TestNewHandshakeForwardedFor pins the security default: X-Forwarded-For is
+// client-supplied, so NewHandshake must ignore it and report the address the
+// socket actually came from. Honoring it unconditionally would let any peer
+// choose the address that authorization, rate limiting and audit logs see.
 func TestNewHandshakeForwardedFor(t *testing.T) {
 	r := httptest.NewRequest("GET", "/socket.io/", nil)
 	r.RemoteAddr = "10.0.0.1:1234"
 	r.Header.Set("X-Forwarded-For", " 203.0.113.7 , 10.0.0.1")
 
 	h := NewHandshake(r, nil)
+	if h.Address != "10.0.0.1" {
+		t.Errorf("Address = %q, want 10.0.0.1 (socket peer; forged XFF must be ignored)", h.Address)
+	}
+}
+
+// TestNewProxiedHandshakeForwardedFor covers the opt-in path used behind a
+// reverse proxy that overwrites X-Forwarded-For: the client-most hop is taken
+// and surrounding whitespace trimmed.
+func TestNewProxiedHandshakeForwardedFor(t *testing.T) {
+	r := httptest.NewRequest("GET", "/socket.io/", nil)
+	r.RemoteAddr = "10.0.0.1:1234"
+	r.Header.Set("X-Forwarded-For", " 203.0.113.7 , 10.0.0.1")
+
+	h := NewProxiedHandshake(r, nil)
 	if h.Address != "203.0.113.7" {
 		t.Errorf("Address = %q, want 203.0.113.7 (first forwarded hop, trimmed)", h.Address)
+	}
+}
+
+// TestNewProxiedHandshakeFallsBackToRemoteAddr covers a trusted-proxy server
+// receiving a request with no X-Forwarded-For at all.
+func TestNewProxiedHandshakeFallsBackToRemoteAddr(t *testing.T) {
+	r := httptest.NewRequest("GET", "/socket.io/", nil)
+	r.RemoteAddr = "10.0.0.1:1234"
+
+	h := NewProxiedHandshake(r, nil)
+	if h.Address != "10.0.0.1" {
+		t.Errorf("Address = %q, want 10.0.0.1", h.Address)
 	}
 }
 

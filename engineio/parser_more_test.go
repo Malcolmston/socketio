@@ -71,12 +71,10 @@ func TestDecodeBadBase64(t *testing.T) {
 }
 
 func TestDecodePayloadEmpty(t *testing.T) {
-	got, err := DecodePayload("")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != nil {
-		t.Errorf("DecodePayload(\"\") = %v, want nil", got)
+	// An empty polling body is malformed: engine.io-parser yields a "parser
+	// error" for "". The port returns an error rather than an empty batch.
+	if _, err := DecodePayload(""); err == nil {
+		t.Error("DecodePayload(\"\") should return an error")
 	}
 }
 

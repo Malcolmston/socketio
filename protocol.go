@@ -1,8 +1,11 @@
 package socketio
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -75,8 +78,22 @@ type Packet struct {
 // BINARY_EVENT/BINARY_ACK packet.
 func (p Packet) Attachments() int { return p.attachments }
 
+// MaxAttachments bounds the number of binary buffers a single BINARY_EVENT or
+// BINARY_ACK packet may declare in its "<n>-" wire prefix. The count is
+// attacker-controlled — it arrives on the wire before any buffer does — so it is
+// validated at decode time rather than trusted by the code that pre-allocates
+// per-attachment storage. A packet declaring more than this is rejected with
+// ErrInvalidPacket. The limit is far above any realistic payload (socket.io's
+// own encoder emits one attachment per []byte argument).
+const MaxAttachments = 1024
+
 // ErrInvalidPacket indicates a malformed Socket.IO packet.
 var ErrInvalidPacket = errors.New("socketio: invalid packet")
+
+// ErrTooManyAttachments indicates a BINARY_EVENT/BINARY_ACK packet declaring
+// more than MaxAttachments binary buffers. It wraps ErrInvalidPacket so callers
+// that only care about malformed input can keep testing for that.
+var ErrTooManyAttachments = fmt.Errorf("%w: too many binary attachments (max %d)", ErrInvalidPacket, MaxAttachments)
 
 // Encode renders a packet to its Socket.IO wire form (the string carried inside
 // an Engine.IO MESSAGE packet).
@@ -87,6 +104,9 @@ func (p Packet) Encode() (string, error) {
 	var b strings.Builder
 	b.WriteByte('0' + byte(p.Type))
 
+	if p.attachments > MaxAttachments {
+		return "", ErrTooManyAttachments
+	}
 	// Binary attachment count prefix for binary packet types.
 	if (p.Type == BinaryEvent || p.Type == BinaryAck) && p.attachments > 0 {
 		b.WriteString(strconv.Itoa(p.attachments))
@@ -101,7 +121,7 @@ func (p Packet) Encode() (string, error) {
 		b.WriteString(strconv.FormatUint(*p.ID, 10))
 	}
 	if p.Data != nil {
-		j, err := json.Marshal(p.Data)
+		j, err := marshalPayload(p.Data)
 		if err != nil {
 			return "", err
 		}
@@ -110,10 +130,62 @@ func (p Packet) Encode() (string, error) {
 	return b.String(), nil
 }
 
+// marshalPayload serialises a Socket.IO payload to the same bytes the reference
+// socket.io-parser (JavaScript JSON.stringify) would produce:
+//
+//   - HTML metacharacters (<, >, &) are emitted raw, not \u-escaped. Go's
+//     encoding/json escapes them by default; JSON.stringify does not, and the
+//     frame is compared byte-for-byte on the wire, so any signature or digest
+//     taken over it must match.
+//   - negative zero (-0) is emitted as 0, matching JSON.stringify(-0) === "0";
+//     Go's json.Marshal would otherwise write "-0".
+func marshalPayload(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(normalizeNegZero(v)); err != nil {
+		return nil, err
+	}
+	// json.Encoder appends a trailing newline; the wire form has none.
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
+}
+
+// normalizeNegZero returns a copy of v with every negative-zero float64 replaced
+// by positive zero, so the encoded frame matches JSON.stringify. It only copies
+// the containers it needs to touch.
+func normalizeNegZero(v any) any {
+	switch x := v.(type) {
+	case float64:
+		if x == 0 && math.Signbit(x) {
+			return 0.0
+		}
+		return x
+	case []any:
+		out := make([]any, len(x))
+		for i := range x {
+			out[i] = normalizeNegZero(x[i])
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(x))
+		for k, vv := range x {
+			out[k] = normalizeNegZero(vv)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
 // DecodePacket parses a Socket.IO packet from its wire form.
 func DecodePacket(s string) (Packet, error) {
 	if s == "" {
-		return Packet{}, ErrInvalidPacket
+		// An empty Socket.IO frame decodes to a CONNECT to the default
+		// namespace, mirroring socket.io-parser: its decodeString does
+		// Number(str.charAt(0)), and Number("") === 0 === PacketType.CONNECT,
+		// with no namespace, id, or payload. Rejecting "" here diverged from the
+		// reference decoder.
+		return Packet{Type: Connect, Namespace: "/"}, nil
 	}
 	var p Packet
 	if s[0] < '0' || s[0] > '6' {
@@ -133,8 +205,18 @@ func DecodePacket(s string) (Packet, error) {
 		}
 		if j > i && j < len(s) && s[j] == '-' {
 			n, err := strconv.Atoi(s[i:j])
-			if err != nil {
+			if err != nil || n <= 0 {
+				// A BINARY_EVENT/BINARY_ACK must declare at least one attachment;
+				// upstream's reconstructor rejects a "0-" header with "Illegal
+				// attachments" (a binary packet with no buffers is meaningless and
+				// was previously decoded as a complete, non-pending packet).
 				return Packet{}, ErrInvalidPacket
+			}
+			if n > MaxAttachments {
+				// Refuse an absurd count before anything sizes a buffer from it:
+				// a declared count of 2^63-1 would otherwise reach make(...) and
+				// panic (or exhaust memory) in the reassembling decoder.
+				return Packet{}, ErrTooManyAttachments
 			}
 			p.attachments = n
 			i = j + 1
@@ -194,27 +276,28 @@ func DecodePacket(s string) (Packet, error) {
 // a payload is always acceptable (except that EVENT/ACK carry their data there).
 //
 // The JavaScript rules, translated to Go's json.Unmarshal value types
-// (object → map[string]any, array → []any, JSON null → nil):
-//   - CONNECT:       typeof payload === "object"  → map, array, or null
-//   - DISCONNECT:    payload === undefined        → never valid when present
-//   - CONNECT_ERROR: string or object             → string, map, array, or null
+// (object → map[string]any, array → []any, JSON null → nil). socket.io-parser's
+// isPayloadValid uses isObject(payload) — `Object.prototype.toString.call(...)
+// === "[object Object]"` — which is true only for a plain object, and false for
+// an array or null:
+//   - CONNECT:       isObject(payload)             → plain object only
+//   - DISCONNECT:    payload === undefined         → never valid when present
+//   - CONNECT_ERROR: isString || isObject          → string or plain object only
 //   - EVENT:         non-empty array
 //   - ACK:           array (any length)
 func isPayloadValid(t PacketType, data any) bool {
 	switch t {
 	case Connect:
-		switch data.(type) {
-		case map[string]any, []any, nil:
-			return true
-		}
-		return false
+		// A plain object only: arrays and null are rejected (isObject()).
+		_, ok := data.(map[string]any)
+		return ok
 	case Disconnect:
 		// A DISCONNECT must not carry a payload; reaching here means one is
 		// present, so it is always invalid.
 		return false
 	case ConnectError:
 		switch data.(type) {
-		case string, map[string]any, []any, nil:
+		case string, map[string]any:
 			return true
 		}
 		return false

@@ -86,10 +86,23 @@ func newReadConn(raw []byte) (*Conn, *bytes.Buffer) {
 	return c, &out
 }
 
+// newServerReadConn builds a client-side Conn that reads the given raw bytes.
+// Server-to-client frames are unmasked, so frames produced by a server (or by
+// the test helper with mask=false) must be read through a client-side Conn —
+// readFrame enforces RFC 6455's rule that a *server* reject unmasked frames.
+func newServerReadConn(raw []byte) (*Conn, *bytes.Buffer) {
+	c, out := newReadConn(raw)
+	c.client = true
+	return c, out
+}
+
+// TestReadFrameUnmasked checks that a client accepts the unmasked frames a
+// server sends. (A server rejecting an unmasked *client* frame is covered by
+// TestServerRejectsUnmaskedClientFrame in ws_limits_test.go.)
 func TestReadFrameUnmasked(t *testing.T) {
 	raw := buildFrame(true, opText, []byte("hello"), false)
-	c, _ := newReadConn(raw)
-	fin, opcode, payload, err := c.readFrame()
+	c, _ := newServerReadConn(raw)
+	fin, opcode, payload, err := c.readFrame(DefaultMaxMessageSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +114,7 @@ func TestReadFrameUnmasked(t *testing.T) {
 func TestReadFrameMaskedUnmasks(t *testing.T) {
 	raw := buildFrame(true, opBinary, []byte{0xde, 0xad, 0xbe, 0xef}, true)
 	c, _ := newReadConn(raw)
-	fin, opcode, payload, err := c.readFrame()
+	fin, opcode, payload, err := c.readFrame(DefaultMaxMessageSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,8 +125,8 @@ func TestReadFrameMaskedUnmasks(t *testing.T) {
 
 func TestReadFrameExtendedLength16(t *testing.T) {
 	msg := bytes.Repeat([]byte("A"), 300) // 126 path (16-bit length)
-	c, _ := newReadConn(buildFrame(true, opText, msg, false))
-	_, _, payload, err := c.readFrame()
+	c, _ := newServerReadConn(buildFrame(true, opText, msg, false))
+	_, _, payload, err := c.readFrame(DefaultMaxMessageSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,8 +137,8 @@ func TestReadFrameExtendedLength16(t *testing.T) {
 
 func TestReadFrameExtendedLength64(t *testing.T) {
 	msg := bytes.Repeat([]byte("B"), 70000) // 127 path (64-bit length)
-	c, _ := newReadConn(buildFrame(true, opText, msg, false))
-	_, _, payload, err := c.readFrame()
+	c, _ := newServerReadConn(buildFrame(true, opText, msg, false))
+	_, _, payload, err := c.readFrame(DefaultMaxMessageSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,8 +150,8 @@ func TestReadFrameExtendedLength64(t *testing.T) {
 func TestReadFrameTruncated(t *testing.T) {
 	// Header claims 5 bytes but only 2 are present.
 	raw := buildFrame(true, opText, []byte("hello"), false)[:4]
-	c, _ := newReadConn(raw)
-	if _, _, _, err := c.readFrame(); err == nil {
+	c, _ := newServerReadConn(raw)
+	if _, _, _, err := c.readFrame(DefaultMaxMessageSize); err == nil {
 		t.Fatal("expected error on truncated frame")
 	}
 }
@@ -190,7 +203,7 @@ func TestWriteFrameClientMasks(t *testing.T) {
 	}
 	// Decode it back through readFrame to confirm the mask round-trips.
 	rc, _ := newReadConn(raw)
-	_, opcode, payload, err := rc.readFrame()
+	_, opcode, payload, err := rc.readFrame(DefaultMaxMessageSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,8 +219,8 @@ func TestWriteFrameExtendedLengths(t *testing.T) {
 		if err := c.WriteMessage(BinaryMessage, msg); err != nil {
 			t.Fatal(err)
 		}
-		rc, _ := newReadConn(out.Bytes())
-		_, _, payload, err := rc.readFrame()
+		rc, _ := newServerReadConn(out.Bytes())
+		_, _, payload, err := rc.readFrame(DefaultMaxMessageSize)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -253,8 +266,8 @@ func TestReadMessageAutoPong(t *testing.T) {
 		t.Fatalf("ReadMessage = %v %q", mt, data)
 	}
 	// A pong echoing the ping payload must have been written.
-	rc, _ := newReadConn(out.Bytes())
-	_, opcode, payload, err := rc.readFrame()
+	rc, _ := newServerReadConn(out.Bytes())
+	_, opcode, payload, err := rc.readFrame(DefaultMaxMessageSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,8 +303,8 @@ func TestReadMessageClose(t *testing.T) {
 		t.Fatal("connection should be closed after close frame")
 	}
 	// A close frame should have been echoed back.
-	rc, _ := newReadConn(out.Bytes())
-	_, opcode, _, err := rc.readFrame()
+	rc, _ := newServerReadConn(out.Bytes())
+	_, opcode, _, err := rc.readFrame(DefaultMaxMessageSize)
 	if err != nil {
 		t.Fatal(err)
 	}

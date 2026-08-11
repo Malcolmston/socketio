@@ -57,10 +57,11 @@ func NewDecoder() *Decoder { return &Decoder{} }
 // attachments). A malformed frame, or a binary attachment arriving with no
 // header pending, returns ErrInvalidPacket.
 //
-// Reassembled binary packets keep their BinaryEvent/BinaryAck type, with every
-// {"_placeholder":true,"num":N} marker in the payload replaced by the matching
-// buffer — mirroring socket.io-parser, whose consumers treat BINARY_EVENT the
-// same as EVENT (use EventName and Args as usual).
+// Reassembled binary packets are rewritten to their plain EVENT/ACK type (with
+// the attachment count cleared) once every {"_placeholder":true,"num":N} marker
+// has been replaced by its buffer — mirroring socket.io-parser, whose Decoder
+// hands consumers an ordinary EVENT/ACK. A placeholder index that points past
+// the attachments supplied is rejected with an error wrapping ErrInvalidPacket.
 func (d *Decoder) Add(frame any) (*Packet, error) {
 	switch f := frame.(type) {
 	case string:
@@ -88,7 +89,23 @@ func (d *Decoder) Add(frame any) (*Packet, error) {
 			return nil, nil
 		}
 		p := *d.pending
-		p.Data = reconstruct(p.Data, d.buffers)
+		data, err := reconstruct(p.Data, d.buffers)
+		if err != nil {
+			d.Reset()
+			return nil, err
+		}
+		p.Data = data
+		// A reassembled binary packet becomes a plain EVENT/ACK, exactly as
+		// socket.io-parser's Decoder does: it rewrites BINARY_EVENT→EVENT and
+		// BINARY_ACK→ACK once every attachment has arrived, and clears the
+		// attachment count, so every consumer downstream sees an ordinary packet.
+		switch p.Type {
+		case BinaryEvent:
+			p.Type = Event
+		case BinaryAck:
+			p.Type = Ack
+		}
+		p.attachments = 0
 		d.Reset()
 		return &p, nil
 	default:

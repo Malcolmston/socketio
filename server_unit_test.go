@@ -47,7 +47,10 @@ func TestNamespaceMiddleware(t *testing.T) {
 				func(_ *Socket, _ func(error)) {}, // never calls next
 				func(_ *Socket, next func(error)) { next(errors.New("unreached")) },
 			},
-			wantErr: "",
+			// A middleware that never calls next must NOT be treated as
+			// acceptance: it denies the connection (the handshake is left
+			// unanswered), reported here as the errMiddlewareSilent sentinel.
+			wantErr: "socketio: middleware did not call next",
 		},
 	}
 	for _, tt := range tests {

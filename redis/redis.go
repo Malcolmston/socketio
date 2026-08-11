@@ -151,8 +151,22 @@ func connect(dial func(string) (net.Conn, error), opts Options) (net.Conn, error
 	return conn, nil
 }
 
+// ErrClosed is returned by Publish once the Broadcaster has been closed. The
+// caller (socketio's broadcast operator) treats a Publish failure as "the
+// cluster link is unavailable" and falls back to local-only delivery, so a
+// closed or broken Redis link degrades instead of silently dropping messages.
+var ErrClosed = errors.New("redis: broadcaster closed")
+
 // Publish implements socketio.Broadcaster: it PUBLISHes data to the channel.
+// It returns ErrClosed after Close, and the underlying I/O error if the Redis
+// connection has failed.
 func (b *Broadcaster) Publish(data []byte) error {
+	b.mu.Lock()
+	closed := b.closed
+	b.mu.Unlock()
+	if closed {
+		return ErrClosed
+	}
 	b.pubMu.Lock()
 	defer b.pubMu.Unlock()
 	if err := writeCommandBytes(b.pubRW.Writer, [][]byte{[]byte("PUBLISH"), []byte(b.channel), data}); err != nil {
@@ -254,9 +268,40 @@ func writeCommandBytes(w *bufio.Writer, args [][]byte) error {
 	return w.Flush()
 }
 
+// MaxBulkLength bounds the declared length of a RESP bulk string ("$<n>") that
+// readReply will accept. The length arrives on the wire before the bytes do, so
+// without a bound a corrupt or hostile peer could make the client allocate an
+// arbitrary amount of memory (or panic in make) from a handful of bytes. 64 MiB
+// is far above any broadcast payload this adapter produces.
+const MaxBulkLength = 64 << 20
+
+// MaxArrayLength bounds the declared element count of a RESP array ("*<n>"),
+// for the same reason as MaxBulkLength: the count is used to size a slice
+// before any element has been read. Redis pub/sub replies have three elements.
+const MaxArrayLength = 1 << 20
+
+// maxReplyDepth bounds RESP array nesting. Real Redis replies nest at most a
+// couple of levels; the bound keeps a hostile stream of "*1\r\n" prefixes from
+// recursing readReply until the goroutine stack is exhausted.
+const maxReplyDepth = 32
+
+// ErrReplyTooLarge is returned when a RESP reply declares a bulk string or
+// array larger than MaxBulkLength / MaxArrayLength, or nests deeper than the
+// internal depth limit. It signals a corrupt or hostile peer, not a transient
+// failure: the connection's framing can no longer be trusted.
+var ErrReplyTooLarge = errors.New("redis: reply exceeds size limit")
+
 // readReply reads one RESP value: simple string/int → string/int64, bulk →
-// []byte, array → []any, error → error.
+// []byte, array → []any, error → error. Malformed input (a non-numeric length,
+// an oversized declaration, excessive nesting) yields an error; it never panics.
 func readReply(r *bufio.Reader) (any, error) {
+	return readReplyDepth(r, 0)
+}
+
+func readReplyDepth(r *bufio.Reader, depth int) (any, error) {
+	if depth > maxReplyDepth {
+		return nil, ErrReplyTooLarge
+	}
 	prefix, err := r.ReadByte()
 	if err != nil {
 		return nil, err
@@ -271,12 +316,21 @@ func readReply(r *bufio.Reader) (any, error) {
 	case '-':
 		return nil, errors.New("redis: " + string(line))
 	case ':':
-		n, _ := strconv.ParseInt(string(line), 10, 64)
+		n, err := strconv.ParseInt(string(line), 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("redis: bad integer reply %q", line)
+		}
 		return n, nil
 	case '$':
-		n, _ := strconv.Atoi(string(line))
+		n, err := strconv.Atoi(string(line))
+		if err != nil {
+			return nil, fmt.Errorf("redis: bad bulk length %q", line)
+		}
 		if n < 0 {
 			return nil, nil
+		}
+		if n > MaxBulkLength {
+			return nil, ErrReplyTooLarge
 		}
 		buf := make([]byte, n)
 		if _, err := readFull(r, buf); err != nil {
@@ -287,13 +341,19 @@ func readReply(r *bufio.Reader) (any, error) {
 		}
 		return buf, nil
 	case '*':
-		n, _ := strconv.Atoi(string(line))
+		n, err := strconv.Atoi(string(line))
+		if err != nil {
+			return nil, fmt.Errorf("redis: bad array length %q", line)
+		}
 		if n < 0 {
 			return nil, nil
 		}
+		if n > MaxArrayLength {
+			return nil, ErrReplyTooLarge
+		}
 		arr := make([]any, n)
 		for i := 0; i < n; i++ {
-			v, err := readReply(r)
+			v, err := readReplyDepth(r, depth+1)
 			if err != nil {
 				return nil, err
 			}

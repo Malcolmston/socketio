@@ -74,6 +74,8 @@ type Client struct {
 	pendingAcks map[uint64]chan []any
 	sid         string
 	closed      bool
+	nsClosed    bool
+	discFired   bool
 	connErr     error
 	pendingBin  *pendingBinary
 
@@ -160,6 +162,10 @@ func (c *Client) establish() error {
 	c.connectedCh = make(chan struct{})
 	c.connectOnce = &sync.Once{}
 	c.connErr = nil
+	// A fresh transport starts a fresh namespace session: clear the
+	// disconnected/disconnect-fired flags so a reconnect delivers events again.
+	c.nsClosed = false
+	c.discFired = false
 	c.mu.Unlock()
 
 	go c.readLoop(conn)
@@ -236,8 +242,14 @@ func (c *Client) On(event string, h Handler) {
 	c.mu.Unlock()
 }
 
-// Emit sends an event to the server.
+// Emit sends an event to the server. Emitting a reserved Socket.IO event name
+// (connect, connect_error, disconnect, disconnecting, ...) returns
+// socketio.ErrReservedEvent without sending anything, matching socket.io-client,
+// which throws for those names.
 func (c *Client) Emit(event string, args ...any) error {
+	if socketio.IsReservedEvent(event) {
+		return socketio.ErrReservedEvent
+	}
 	data := append([]any{event}, args...)
 	return c.sendPacket(socketio.Packet{Type: socketio.Event, Namespace: c.namespace, Data: data})
 }
@@ -345,7 +357,9 @@ func (c *Client) readLoop(conn *ws.Conn) {
 }
 
 // handleDisconnect fails any pending acks and, when reconnection is enabled and
-// the client was not closed by the user, starts the reconnect loop.
+// the client was not closed by the user, starts the reconnect loop. The reason
+// mirrors socket.io-client's disconnect reasons: a transport that drops without
+// a namespace DISCONNECT packet reports "transport close".
 func (c *Client) handleDisconnect() {
 	c.mu.Lock()
 	closed := c.closed
@@ -353,10 +367,25 @@ func (c *Client) handleDisconnect() {
 	c.mu.Unlock()
 	// In-flight EmitWithAck calls unblock via their own timeout.
 
-	c.fireLocal("disconnect")
+	c.fireDisconnectOnce("transport close")
 	if reconnect {
 		go c.reconnectLoop()
 	}
+}
+
+// fireDisconnectOnce emits the local "disconnect" event with a reason argument,
+// at most once per connection. socket.io-client's "disconnect" always carries a
+// reason; a server-initiated namespace disconnect reports "io server
+// disconnect", a dropped transport "transport close".
+func (c *Client) fireDisconnectOnce(reason string) {
+	c.mu.Lock()
+	if c.discFired {
+		c.mu.Unlock()
+		return
+	}
+	c.discFired = true
+	c.mu.Unlock()
+	c.fireLocal("disconnect", reason)
 }
 
 func (c *Client) handleSioPacket(raw string) {
@@ -364,7 +393,25 @@ func (c *Client) handleSioPacket(raw string) {
 	if err != nil || pkt.Namespace != c.namespace {
 		return
 	}
+	// Once the server has disconnected this namespace, ignore any further
+	// packets for it — upstream drops events that arrive after a DISCONNECT
+	// rather than delivering them to handlers.
+	c.mu.Lock()
+	nsClosed := c.nsClosed
+	c.mu.Unlock()
+	if nsClosed {
+		return
+	}
 	switch pkt.Type {
+	case socketio.Disconnect:
+		// Server-initiated namespace disconnect. Mark the namespace closed, fire
+		// the local "disconnect" with the reason socket.io-client uses, and stop
+		// delivering events. Previously this packet had no case and was dropped,
+		// so the client never learned about a namespace-level disconnect.
+		c.mu.Lock()
+		c.nsClosed = true
+		c.mu.Unlock()
+		c.fireDisconnectOnce("io server disconnect")
 	case socketio.Connect:
 		if obj, ok := pkt.Data.(map[string]any); ok {
 			if id, ok := obj["sid"].(string); ok {
@@ -415,7 +462,13 @@ func (c *Client) handleBinaryAttachment(buf []byte) {
 	c.mu.Unlock()
 
 	pkt := pb.packet
-	pkt.Data = socketio.Reconstruct(pkt.Data, pb.buffers)
+	data, err := socketio.Reconstruct(pkt.Data, pb.buffers)
+	if err != nil {
+		// Drop a frame with an out-of-range binary placeholder rather than
+		// dispatching a raw placeholder object to a handler as if it were data.
+		return
+	}
+	pkt.Data = data
 	c.dispatchBinary(pkt)
 }
 
@@ -454,10 +507,11 @@ func (c *Client) dispatch(pkt socketio.Packet) {
 			ack = reply
 		}
 	}
-	if pkt.ID != nil {
-		if ack == nil {
-			ack = []any{}
-		}
+	// Acknowledge only when a handler actually produced an ack (returned a
+	// non-nil slice). Auto-acking an event no handler handled made the server's
+	// EmitAck timeout unreachable when the peer was a Go client, and erased the
+	// difference between "handled, nothing to report" and "no handler at all".
+	if pkt.ID != nil && ack != nil {
 		_ = c.sendPacket(socketio.Packet{Type: socketio.Ack, Namespace: c.namespace, ID: pkt.ID, Data: ack})
 	}
 }

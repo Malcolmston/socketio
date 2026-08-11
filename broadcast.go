@@ -68,9 +68,20 @@ func (b *BroadcastOperator) Emit(event string, args ...any) {
 			Event:     event,
 			Args:      args,
 		}
+		// Publishing succeeds only when the cluster link is healthy. Redis
+		// pub/sub echoes the message back to the publisher, so on success the
+		// local sockets are served by the same delivery path as every other
+		// node's and must not be emitted to twice.
+		//
+		// If Publish fails (Redis down, connection closed, payload not
+		// serializable) the broadcast used to be dropped entirely — local
+		// sockets never saw it. Degrade to local-only delivery instead, so an
+		// unavailable Redis costs cross-node fan-out rather than the whole
+		// broadcast.
 		if data, err := json.Marshal(msg); err == nil {
-			_ = bc.Publish(data)
-			return
+			if err := bc.Publish(data); err == nil {
+				return
+			}
 		}
 	}
 	b.emitLocalExcept(skip, event, args...)

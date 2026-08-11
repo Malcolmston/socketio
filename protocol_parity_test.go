@@ -250,12 +250,10 @@ func TestParityParserBinary(t *testing.T) {
 			if out == nil {
 				t.Fatal("Decoder produced no packet")
 			}
+			// socket.io-parser rewrites a reassembled BINARY_EVENT/BINARY_ACK back
+			// to its plain EVENT/ACK type, so the decoded packet keeps the
+			// original (non-binary) type.
 			wantType := c.pkt.Type
-			if wantType == Event {
-				wantType = BinaryEvent
-			} else if wantType == Ack {
-				wantType = BinaryAck
-			}
 			if out.Type != wantType {
 				t.Errorf("decoded Type = %v, want %v", out.Type, wantType)
 			}
