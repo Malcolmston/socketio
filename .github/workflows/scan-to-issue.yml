@@ -28,7 +28,7 @@ jobs:
           set +e
           "$(go env GOPATH)/bin/govulncheck" ./... > govuln.txt 2>&1
           echo "code=$?" >> "$GITHUB_OUTPUT"
-      - uses: actions/github-script@v7
+      - uses: actions/github-script@v9
         env:
           SCAN_CODE: ${{ steps.scan.outputs.code }}
         with:
